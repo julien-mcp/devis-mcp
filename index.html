@@ -694,6 +694,62 @@ dialog.modal::backdrop { background: rgba(0,0,0,0.6); backdrop-filter: blur(2px)
 ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 5px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
 
+/* ===== Badges quantité et coefficient ===== */
+.dispo-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 2px 7px;
+  font-size: 10px;
+  font-weight: 600;
+  border-radius: 2px;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  letter-spacing: 0.04em;
+}
+.dispo-badge.over {
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
+.coef-badge {
+  display: inline-block;
+  padding: 3px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: 3px;
+  background: var(--accent-bg);
+  color: var(--accent);
+  cursor: pointer;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  transition: background 0.12s;
+}
+.coef-badge:hover {
+  background: var(--accent);
+  color: var(--accent-text);
+}
+.coef-badge.full {
+  background: var(--surface-2);
+  color: var(--text-muted);
+}
+.coef-badge.full:hover {
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+.coef-badge small {
+  font-size: 9px;
+  margin-left: 2px;
+  opacity: 0.7;
+}
+
+.line-table input.over {
+  border-color: var(--warning);
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
+.col-coef { width: 75px; }
+
 /* ===== Impression PDF ===== */
 @media print {
   header.app-header, .header-actions, .add-row, .card-actions,
@@ -927,7 +983,9 @@ dialog.modal::backdrop { background: rgba(0,0,0,0.6); backdrop-filter: blur(2px)
                 <th class="col-poste">Équipement</th>
                 <th class="col-source ctr">Source</th>
                 <th class="col-rate num">€/jour</th>
+                <th class="col-qty num">Qté</th>
                 <th class="col-qty num">Jours</th>
+                <th class="col-coef ctr">Coef</th>
                 <th class="col-total num">Total</th>
                 <th class="col-action"></th>
               </tr>
@@ -1451,7 +1509,21 @@ let devisList = loadDevisList();
 let devis = null;
 
 // Initialiser le devis courant
+function migrateDevis(d) {
+  // Patch des devis créés avant la colonne 'qte' pour le matériel
+  if (d && Array.isArray(d.materiel)) {
+    d.materiel.forEach(line => {
+      if (line.qte == null) line.qte = 1;
+      if (line.noDegressivite == null) line.noDegressivite = false;
+    });
+  }
+}
+
 function initCurrentDevis() {
+  // Migrer tous les devis de la liste
+  devisList.forEach(migrateDevis);
+  saveDevisList();
+  
   const currentId = loadCurrentId();
   if (currentId) {
     const found = devisList.find(d => d.id === currentId);
@@ -1642,7 +1714,24 @@ function lineTotalPoste(line) {
   return getPosteRate(line.posteId, line.source) * (parseNum(line.jours) || 0);
 }
 function lineTotalMateriel(line) {
-  return getMaterielRate(line.matId) * (parseNum(line.jours) || 0);
+  const mat = params.materiel.find(m => m.id === line.matId);
+  if (!mat) return 0;
+  const prix = mat.prix;
+  const qte = parseNum(line.qte) || 1;
+  const jours = parseNum(line.jours) || 0;
+  const coef = line.noDegressivite ? jours : getCoefficient(mat.cat, jours);
+  // Note : si dégressivité active, coef remplace "jours" (déjà jours-équivalents).
+  // Si pas de dégressivité (plein tarif), coef = jours direct.
+  return prix * qte * coef;
+}
+
+// Renvoie le coefficient effectivement appliqué à une ligne (pour affichage)
+function lineCoefMateriel(line) {
+  const mat = params.materiel.find(m => m.id === line.matId);
+  if (!mat) return 1;
+  const jours = parseNum(line.jours) || 0;
+  if (line.noDegressivite) return jours;
+  return getCoefficient(mat.cat, jours);
 }
 function lineTotalFrais(line) {
   return (parseNum(line.pu) || 0) * (parseNum(line.qte) || 0);
@@ -1761,16 +1850,21 @@ function renderMaterielSection() {
   const tbody = document.querySelector('#tbl-materiel tbody');
   tbody.innerHTML = '';
   if (devis.materiel.length === 0) {
-    tbody.innerHTML = '<tr class="empty-row"><td colspan="6">Aucun équipement</td></tr>';
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="8">Aucun équipement</td></tr>';
   } else {
     devis.materiel.forEach((line, idx) => {
       const mat = params.materiel.find(m => m.id === line.matId);
       if (!mat) return;
       const tr = document.createElement('tr');
       if (line._flash) { tr.classList.add('flash'); delete line._flash; }
-      const rate = mat.prix;
-      const total = rate * (parseNum(line.jours) || 0);
-      // Source : si parc dispo, sélecteur ; sinon badge fixé
+      
+      const prix = mat.prix;
+      const qte = parseNum(line.qte) || 1;
+      const jours = parseNum(line.jours) || 0;
+      const coef = lineCoefMateriel(line);
+      const total = prix * qte * coef;
+
+      // Cellule Source
       let sourceCell;
       if (mat.parc) {
         sourceCell = `<select class="source-select" data-action="mat-source" data-idx="${idx}">
@@ -1780,11 +1874,38 @@ function renderMaterielSection() {
       } else {
         sourceCell = `<span class="badge loue">loué</span>`;
       }
+      
+      // Badge dispo (uniquement si parc=true et qteDispo connu)
+      const qteDispo = mat.qteDispo;
+      const overQte = (mat.parc && line.source === 'parc' && qteDispo > 0 && qte > qteDispo);
+      let qteBadge = '';
+      if (mat.parc && qteDispo > 0 && line.source === 'parc') {
+        const overCls = overQte ? 'over' : '';
+        qteBadge = `<span class="dispo-badge ${overCls}" title="${overQte ? 'Quantité demandée supérieure au stock parc !' : 'Disponible en parc'}">${qte}/${qteDispo}</span>`;
+      }
+      
+      // Badge coefficient (cliquable pour toggle plein tarif)
+      const baseCoefForCat = getCoefficient(mat.cat, jours);
+      let coefBadge;
+      if (line.noDegressivite) {
+        // Mode plein tarif : on multiplie par "jours" direct
+        coefBadge = `<span class="coef-badge full" data-action="mat-toggle-degress" data-idx="${idx}" title="Plein tarif (cliquer pour réactiver la dégressivité)">×${jours.toFixed(jours % 1 ? 1 : 0)} <small>plein</small></span>`;
+      } else if (jours > 0) {
+        coefBadge = `<span class="coef-badge" data-action="mat-toggle-degress" data-idx="${idx}" title="Coefficient dégressif (cliquer pour mettre en plein tarif)">×${baseCoefForCat.toFixed(2).replace(/\.?0+$/, '')}</span>`;
+      } else {
+        coefBadge = '';
+      }
+      
       tr.innerHTML = `
-        <td>${escapeHtml(mat.nom)}</td>
+        <td>
+          ${escapeHtml(mat.nom)}
+          ${qteBadge}
+        </td>
         <td class="ctr">${sourceCell}</td>
-        <td class="num">${fmtEur(rate)}</td>
+        <td class="num">${fmtEur(prix)}</td>
+        <td class="num"><input type="text" class="num qty ${overQte ? 'over' : ''}" value="${qte}" data-action="mat-qte" data-idx="${idx}"></td>
         <td class="num"><input type="text" class="num qty" value="${line.jours}" data-action="mat-jours" data-idx="${idx}"></td>
+        <td class="ctr">${coefBadge}</td>
         <td class="num total">${fmtEur(total)}</td>
         <td class="ctr"><button class="subtle icon-only" data-action="mat-delete" data-idx="${idx}" title="Supprimer">✕</button></td>
       `;
@@ -1897,7 +2018,8 @@ function addMaterielLine(matId, opts) {
   if (!mat) return;
   const defaultSource = mat.parc ? 'parc' : 'loue';
   const jours = opts && opts.jours ? opts.jours : 1;
-  devis.materiel.push({ id: uid(), matId, source: defaultSource, jours, _flash: true });
+  const qte = opts && opts.qte ? opts.qte : 1;
+  devis.materiel.push({ id: uid(), matId, source: defaultSource, qte, jours, noDegressivite: false, _flash: true });
   saveDevis(); renderDevis();
 }
 function addFraisLine(fraisId) {
@@ -1921,6 +2043,7 @@ document.addEventListener('input', (e) => {
     const phase = t.dataset.phase;
     if (action === 'jours') { devis[phase][idx].jours = t.value; saveDevis(); renderPosteSection(phase); renderRecap(); }
     else if (action === 'mat-jours') { devis.materiel[idx].jours = t.value; saveDevis(); renderMaterielSection(); renderRecap(); }
+    else if (action === 'mat-qte') { devis.materiel[idx].qte = t.value; saveDevis(); renderMaterielSection(); renderRecap(); }
     else if (action === 'frais-pu') { devis.frais[idx].pu = t.value; saveDevis(); renderRecap(); refreshFraisRowTotal(idx); }
     else if (action === 'frais-qte') { devis.frais[idx].qte = t.value; saveDevis(); renderRecap(); refreshFraisRowTotal(idx); }
     else if (action === 'frais-nom') { devis.frais[idx].nom = t.value; saveDevis(); }
@@ -1990,6 +2113,10 @@ document.addEventListener('click', (e) => {
     if (action === 'delete') { devis[phase].splice(idx, 1); saveDevis(); renderDevis(); }
     else if (action === 'mat-delete') { devis.materiel.splice(idx, 1); saveDevis(); renderDevis(); }
     else if (action === 'frais-delete') { devis.frais.splice(idx, 1); saveDevis(); renderDevis(); }
+    else if (action === 'mat-toggle-degress') { 
+      devis.materiel[idx].noDegressivite = !devis.materiel[idx].noDegressivite;
+      saveDevis(); renderMaterielSection(); renderRecap();
+    }
     return;
   }
   // Catalog deletes
@@ -2728,9 +2855,110 @@ let RUNTIME_TOKEN = null;
 const SHEETS_CONFIG = {
   enabled: true,
   csvUrl: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vTsH5NRRUZHQHe3uNjuRuREmO5rztTEXnGCQc-75W_vlVwqxtYuh5hK9nzejbIICOQ-uWb4znfWSRnJ/pub?gid=2007774556&single=true&output=csv',
+  baremeCsvUrl: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vTsH5NRRUZHQHe3uNjuRuREmO5rztTEXnGCQc-75W_vlVwqxtYuh5hK9nzejbIICOQ-uWb4znfWSRnJ/pub?gid=2034338566&single=true&output=csv',  // optionnel : si non rempli, barème par défaut
 };
 
 let lastSheetsSync = null;   // timestamp de la dernière sync réussie
+
+// ============================================================
+//  BARÈME DE DÉGRESSIVITÉ
+// ============================================================
+// Format : tableau de paliers, chaque palier = { jours, cam_optique, son, lumiere_regie_moniteur, support_cables }
+// Interpolation linéaire entre paliers, plafonnement au-delà du dernier.
+
+const DEFAULT_BAREME = [
+  { jours: 1,  cam_optique: 1.00, son: 1.00, lumiere_regie_moniteur: 1.00, support_cables: 1.00 },
+  { jours: 2,  cam_optique: 1.50, son: 1.60, lumiere_regie_moniteur: 1.70, support_cables: 1.80 },
+  { jours: 3,  cam_optique: 1.90, son: 2.10, lumiere_regie_moniteur: 2.20, support_cables: 2.40 },
+  { jours: 4,  cam_optique: 2.20, son: 2.50, lumiere_regie_moniteur: 2.60, support_cables: 2.90 },
+  { jours: 5,  cam_optique: 2.50, son: 2.80, lumiere_regie_moniteur: 3.00, support_cables: 3.30 },
+  { jours: 7,  cam_optique: 3.00, son: 3.40, lumiere_regie_moniteur: 3.60, support_cables: 4.00 },
+  { jours: 10, cam_optique: 3.80, son: 4.30, lumiere_regie_moniteur: 4.50, support_cables: 5.00 },
+  { jours: 15, cam_optique: 5.00, son: 5.60, lumiere_regie_moniteur: 6.00, support_cables: 6.80 },
+  { jours: 30, cam_optique: 7.50, son: 8.50, lumiere_regie_moniteur: 9.00, support_cables: 10.00 },
+];
+
+let bareme = [...DEFAULT_BAREME];
+
+// Mapping catégorie -> colonne du barème
+function baremeColumnForCategory(cat) {
+  const c = (cat || '').toLowerCase();
+  if (c === 'caméra' || c === 'optique' || c === 'camera') return 'cam_optique';
+  if (c === 'son') return 'son';
+  if (c === 'lumière' || c === 'lumiere' || c === 'régie' || c === 'regie' || c === 'moniteur') return 'lumiere_regie_moniteur';
+  // Support, Câbles, Accessoires, Autre…
+  return 'support_cables';
+}
+
+// Calcule le coefficient pour une catégorie donnée et un nombre de jours
+function getCoefficient(cat, jours) {
+  const col = baremeColumnForCategory(cat);
+  const j = parseFloat(jours) || 0;
+  if (j <= 0) return 0;
+  if (j < 1) return bareme[0][col];  // < 1 jour : coef du palier 1 jour (pas de bonus en-dessous)
+  // Trouver les 2 paliers encadrants
+  if (j >= bareme[bareme.length - 1].jours) {
+    return bareme[bareme.length - 1][col];
+  }
+  for (let i = 0; i < bareme.length - 1; i++) {
+    const p1 = bareme[i];
+    const p2 = bareme[i + 1];
+    if (j >= p1.jours && j <= p2.jours) {
+      // Interpolation linéaire
+      const ratio = (j - p1.jours) / (p2.jours - p1.jours);
+      return p1[col] + ratio * (p2[col] - p1[col]);
+    }
+  }
+  return 1;
+}
+
+// Parser CSV du barème
+function parseCsvBareme(csv) {
+  const lines = csv.split(/\r?\n/).filter(l => l.trim().length > 0);
+  if (lines.length < 2) return null;
+  const headers = parseCsvLine(lines[0]).map(h => h.trim().toLowerCase());
+  const idxJ = headers.indexOf('jours');
+  const idxCam = headers.indexOf('cam_optique');
+  const idxSon = headers.indexOf('son');
+  const idxLum = headers.indexOf('lumiere_regie_moniteur');
+  const idxSup = headers.indexOf('support_cables');
+  if (idxJ < 0 || idxCam < 0 || idxSon < 0 || idxLum < 0 || idxSup < 0) {
+    console.warn('[Barème] CSV mal formé : colonnes manquantes');
+    return null;
+  }
+  const items = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cells = parseCsvLine(lines[i]);
+    const jours = parseFloat((cells[idxJ] || '').replace(',', '.'));
+    if (!isFinite(jours) || jours <= 0) continue;
+    items.push({
+      jours,
+      cam_optique: parseFloat((cells[idxCam] || '1').replace(',', '.')),
+      son: parseFloat((cells[idxSon] || '1').replace(',', '.')),
+      lumiere_regie_moniteur: parseFloat((cells[idxLum] || '1').replace(',', '.')),
+      support_cables: parseFloat((cells[idxSup] || '1').replace(',', '.')),
+    });
+  }
+  items.sort((a, b) => a.jours - b.jours);
+  return items;
+}
+
+async function fetchBaremeFromSheets() {
+  if (!SHEETS_CONFIG.enabled || !SHEETS_CONFIG.baremeCsvUrl || SHEETS_CONFIG.baremeCsvUrl.startsWith('METTRE_ICI')) {
+    return null;
+  }
+  try {
+    const url = SHEETS_CONFIG.baremeCsvUrl + (SHEETS_CONFIG.baremeCsvUrl.includes('?') ? '&' : '?') + '_ts=' + Date.now();
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const csv = await res.text();
+    return parseCsvBareme(csv);
+  } catch (err) {
+    console.warn('[Barème] Erreur fetch CSV:', err.message);
+    return null;
+  }
+}
+
 
 
 // ============================================================
@@ -2932,6 +3160,7 @@ function parseCsvMateriel(csv) {
   const idxCat = headers.indexOf('categorie');
   const idxPrix = headers.indexOf('prix_jour');
   const idxParc = headers.indexOf('dispo_parc');
+  const idxQte = headers.indexOf('quantite');  // optionnel
   if (idxId < 0 || idxNom < 0 || idxCat < 0 || idxPrix < 0 || idxParc < 0) {
     console.warn('[Inventaire] CSV mal formé : colonnes manquantes. Attendu: id, nom, categorie, prix_jour, dispo_parc');
     return null;
@@ -2944,12 +3173,15 @@ function parseCsvMateriel(csv) {
     const prix = parseFloat((cells[idxPrix] || '0').replace(',', '.').replace(/[^\d.-]/g, ''));
     const parcStr = (cells[idxParc] || '').trim().toUpperCase();
     const parc = parcStr === 'TRUE' || parcStr === 'VRAI' || parcStr === '1' || parcStr === 'OUI' || parcStr === 'YES';
+    const qteStr = (cells[idxQte] >= 0 ? cells[idxQte] : '0');
+    const qteDispo = parseInt((qteStr || '0').replace(/[^\d-]/g, ''), 10) || 0;
     items.push({
       id,
       nom: (cells[idxNom] || '').trim(),
       cat: (cells[idxCat] || 'Autre').trim(),
       prix: isFinite(prix) ? prix : 0,
       parc,
+      qteDispo,
     });
   }
   return items;
@@ -2957,22 +3189,25 @@ function parseCsvMateriel(csv) {
 
 async function syncInventaireOnStart() {
   if (!SHEETS_CONFIG.enabled) return;
+  // 1) Récupérer le barème (optionnel — si absent on garde le défaut)
+  const freshBareme = await fetchBaremeFromSheets();
+  if (freshBareme && freshBareme.length > 0) {
+    bareme = freshBareme;
+    console.log('[Barème] Mis à jour depuis Sheets (' + freshBareme.length + ' paliers)');
+  }
+  // 2) Récupérer l'inventaire matériel
   const fresh = await fetchInventaireFromSheets();
   if (!fresh) return;
   if (fresh.length === 0) {
     console.warn('[Inventaire] CSV vide, on garde le catalogue actuel');
     return;
   }
-  // Remplace le catalogue
   params.materiel = fresh;
   lastSheetsSync = Date.now();
-  // Sauvegarde locale (sans déclencher de sync Gist, le matos vient de Sheets)
   _origSaveParams();
-  // Si on est sur la vue Paramètres, re-render le tableau
   if (document.getElementById('view-params').classList.contains('active')) {
     renderParams();
   }
-  // Re-render le récap (en cas de prix changé sur des items du devis en cours)
   renderDevis();
   updateSheetsSyncUI();
   toast('Inventaire matériel synchronisé (' + fresh.length + ' items)');
