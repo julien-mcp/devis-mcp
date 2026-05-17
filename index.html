@@ -2086,9 +2086,24 @@ document.addEventListener('input', (e) => {
   if (action) {
     const idx = parseInt(t.dataset.idx, 10);
     const phase = t.dataset.phase;
-    if (action === 'jours') { devis[phase][idx].jours = t.value; saveDevis(); renderPosteSection(phase); renderRecap(); }
-    else if (action === 'mat-jours') { devis.materiel[idx].jours = t.value; saveDevis(); renderMaterielSection(); renderRecap(); }
-    else if (action === 'mat-qte') { devis.materiel[idx].qte = t.value; saveDevis(); renderMaterielSection(); renderRecap(); }
+    if (action === 'jours') { 
+      devis[phase][idx].jours = t.value; saveDevis();
+      refreshPosteRowTotal(phase, idx);
+      refreshSectionSubtotal(phase);
+      renderRecap();
+    }
+    else if (action === 'mat-jours') { 
+      devis.materiel[idx].jours = t.value; saveDevis();
+      refreshMaterielRowTotal(idx);
+      refreshMaterielSubtotal();
+      renderRecap();
+    }
+    else if (action === 'mat-qte') { 
+      devis.materiel[idx].qte = t.value; saveDevis();
+      refreshMaterielRowTotal(idx);
+      refreshMaterielSubtotal();
+      renderRecap();
+    }
     else if (action === 'frais-pu') { devis.frais[idx].pu = t.value; saveDevis(); renderRecap(); refreshFraisRowTotal(idx); }
     else if (action === 'frais-qte') { devis.frais[idx].qte = t.value; saveDevis(); renderRecap(); refreshFraisRowTotal(idx); }
     else if (action === 'frais-nom') { devis.frais[idx].nom = t.value; saveDevis(); }
@@ -2116,6 +2131,97 @@ document.addEventListener('input', (e) => {
     return;
   }
 });
+
+function refreshPosteRowTotal(phase, idx) {
+  const tbody = document.querySelector('#tbl-' + phase + ' tbody');
+  if (!tbody || !tbody.children[idx]) return;
+  const line = devis[phase][idx];
+  const total = lineTotalPoste(line);
+  const totalCell = tbody.children[idx].querySelector('.total');
+  if (totalCell) totalCell.textContent = fmtEur(total);
+}
+
+function refreshSectionSubtotal(phase) {
+  const idMap = { preprod: 'st-preprod', prod: 'st-prod', postprod: 'st-postprod' };
+  const el = document.getElementById(idMap[phase]);
+  if (el) el.textContent = fmtEur(totalSection(devis[phase], lineTotalPoste));
+}
+
+function refreshMaterielRowTotal(idx) {
+  const tbody = document.querySelector('#tbl-materiel tbody');
+  if (!tbody || !tbody.children[idx]) return;
+  const line = devis.materiel[idx];
+  const mat = params.materiel.find(m => m.id === line.matId);
+  if (!mat) return;
+  const tr = tbody.children[idx];
+  const qte = parseNum(line.qte) || 1;
+  const jours = parseNum(line.jours) || 0;
+  const coef = lineCoefMateriel(line);
+  const total = mat.prix * qte * coef;
+
+  // Mettre à jour la cellule total
+  const totalCell = tr.querySelector('.total');
+  if (totalCell) totalCell.textContent = fmtEur(total);
+
+  // Mettre à jour le badge coefficient (affichage du coef calculé)
+  const coefCell = tr.querySelector('.coef-badge');
+  if (coefCell) {
+    const baseCoef = getCoefficient(mat.cat, jours);
+    if (line.noDegressivite) {
+      coefCell.innerHTML = '×' + jours.toFixed(jours % 1 ? 1 : 0) + ' <small>plein</small>';
+    } else if (jours > 0) {
+      coefCell.textContent = '×' + baseCoef.toFixed(2).replace(/\.?0+$/, '');
+    } else {
+      coefCell.textContent = '';
+    }
+  }
+
+  // Mettre à jour la répartition (source + dispo + sublou)
+  const rep = lineRepartition(line);
+  const stock = mat.qteDispo || 0;
+
+  // Cellule source (1ère cellule .ctr après le nom)
+  const sourceCell = tr.children[1]; // td.ctr de Source
+  if (sourceCell) {
+    let html;
+    if (rep.qteParc > 0 && rep.qteLoue > 0) {
+      html = '<span class="badge mixed" title="' + rep.qteParc + ' venant du parc + ' + rep.qteLoue + ' sous-loué(s)">' + rep.qteParc + ' parc + ' + rep.qteLoue + ' loué</span>';
+    } else if (rep.qteParc > 0) {
+      html = '<span class="badge parc">parc</span>';
+    } else {
+      html = '<span class="badge loue">loué</span>';
+    }
+    sourceCell.innerHTML = html;
+  }
+
+  // Première cellule (nom + badges)
+  const nameCell = tr.children[0];
+  if (nameCell) {
+    let extras = '';
+    if (mat.parc && stock > 0) {
+      const overCls = rep.qteLoue > 0 ? 'over' : '';
+      const title = rep.qteLoue > 0 
+        ? rep.qteParc + ' en parc + ' + rep.qteLoue + ' à sous-louer' 
+        : 'Disponible en parc';
+      extras += '<span class="dispo-badge ' + overCls + '" title="' + title + '">' + qte + '/' + stock + '</span>';
+    }
+    if (rep.qteLoue > 0 && mat.parc && stock > 0) {
+      extras += '<span class="sublou-badge" title="' + rep.qteLoue + ' sous-loué(s) chez un loueur">+' + rep.qteLoue + ' sous-loué' + (rep.qteLoue > 1 ? 's' : '') + '</span>';
+    }
+    nameCell.innerHTML = escapeHtml(mat.nom) + ' ' + extras;
+  }
+
+  // Classe "over" sur l'input qte
+  const qteInput = tr.querySelector('input[data-action="mat-qte"]');
+  if (qteInput) {
+    if (rep.qteLoue > 0 && mat.parc) qteInput.classList.add('over');
+    else qteInput.classList.remove('over');
+  }
+}
+
+function refreshMaterielSubtotal() {
+  document.getElementById('st-materiel').textContent = fmtEur(totalSection(devis.materiel, lineTotalMateriel));
+}
 
 function refreshFraisRowTotal(idx) {
   const tbody = document.querySelector('#tbl-frais tbody');
@@ -2914,7 +3020,7 @@ let RUNTIME_TOKEN = null;
 const SHEETS_CONFIG = {
   enabled: true,
   csvUrl: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vTsH5NRRUZHQHe3uNjuRuREmO5rztTEXnGCQc-75W_vlVwqxtYuh5hK9nzejbIICOQ-uWb4znfWSRnJ/pub?gid=2007774556&single=true&output=csv',
-  baremeCsvUrl: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vTsH5NRRUZHQHe3uNjuRuREmO5rztTEXnGCQc-75W_vlVwqxtYuh5hK9nzejbIICOQ-uWb4znfWSRnJ/pub?gid=2034338566&single=true&output=csv',  // optionnel : si non rempli, barème par défaut
+  baremeCsvUrl: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vTsH5NRRUZHQHe3uNjuRuREmO5rztTEXnGCQc-75W_vlVwqxtYuh5hK9nzejbIICOQ-uWb4znfWSRnJ/pub?gid=2034338566&single=true&output=csv',
 };
 
 let lastSheetsSync = null;   // timestamp de la dernière sync réussie
@@ -3218,10 +3324,10 @@ function parseCsvMateriel(csv) {
   const idxNom = headers.indexOf('nom');
   const idxCat = headers.indexOf('categorie');
   const idxPrix = headers.indexOf('prix_jour');
-  const idxParc = headers.indexOf('dispo_parc');
-  const idxQte = headers.indexOf('quantite');  // optionnel
-  if (idxId < 0 || idxNom < 0 || idxCat < 0 || idxPrix < 0 || idxParc < 0) {
-    console.warn('[Inventaire] CSV mal formé : colonnes manquantes. Attendu: id, nom, categorie, prix_jour, dispo_parc');
+  const idxParc = headers.indexOf('dispo_parc');  // optionnel : déduit de quantite si absent
+  const idxQte = headers.indexOf('quantite');     // optionnel
+  if (idxId < 0 || idxNom < 0 || idxCat < 0 || idxPrix < 0) {
+    console.warn('[Inventaire] CSV mal formé : colonnes manquantes. Attendu: id, nom, categorie, prix_jour (et optionnellement quantite, dispo_parc)');
     return null;
   }
   const items = [];
@@ -3230,10 +3336,18 @@ function parseCsvMateriel(csv) {
     const id = (cells[idxId] || '').trim();
     if (!id) continue;
     const prix = parseFloat((cells[idxPrix] || '0').replace(',', '.').replace(/[^\d.-]/g, ''));
-    const parcStr = (cells[idxParc] || '').trim().toUpperCase();
-    const parc = parcStr === 'TRUE' || parcStr === 'VRAI' || parcStr === '1' || parcStr === 'OUI' || parcStr === 'YES';
-    const qteStr = (cells[idxQte] >= 0 ? cells[idxQte] : '0');
+    // Quantité dispo en parc
+    const qteStr = (idxQte >= 0 ? cells[idxQte] : '0');
     const qteDispo = parseInt((qteStr || '0').replace(/[^\d-]/g, ''), 10) || 0;
+    // dispo_parc : si la colonne existe, on lit sa valeur ; sinon on déduit de la quantité
+    let parc;
+    if (idxParc >= 0) {
+      const parcStr = (cells[idxParc] || '').trim().toUpperCase();
+      parc = parcStr === 'TRUE' || parcStr === 'VRAI' || parcStr === '1' || parcStr === 'OUI' || parcStr === 'YES';
+    } else {
+      // Pas de colonne dispo_parc : on déduit. quantité > 0 = en parc, sinon loué
+      parc = qteDispo > 0;
+    }
     items.push({
       id,
       nom: (cells[idxNom] || '').trim(),
