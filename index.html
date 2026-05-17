@@ -1120,6 +1120,7 @@ dialog.modal::backdrop { background: rgba(0,0,0,0.6); backdrop-filter: blur(2px)
         <p class="help-text" style="margin-bottom: 14px;">
           Coche "Dispo en parc" si tu possèdes cet équipement, sinon il sera marqué comme loué chez un loueur.
         </p>
+        <p class="help-text" id="sheets-sync-status" style="margin-bottom: 14px; padding: 8px 12px; background: var(--surface-2); border-radius: 4px; border-left: 3px solid var(--accent);"></p>
         <table class="line-table">
           <thead>
             <tr>
@@ -2229,14 +2230,20 @@ function renderParams() {
     </tr>`).join('');
 
   const tbodyM = document.getElementById('catalog-materiel');
+  const matReadonly = SHEETS_CONFIG.enabled;
+  const ro = matReadonly ? 'readonly disabled' : '';
   tbodyM.innerHTML = params.materiel.map((m, i) => `
     <tr>
-      <td><input type="text" value="${escapeHtml(m.nom)}" data-cat-action="mat-nom" data-idx="${i}"></td>
-      <td><input type="text" value="${escapeHtml(m.cat)}" data-cat-action="mat-cat" data-idx="${i}"></td>
-      <td class="num"><input type="text" class="num rate" value="${m.prix}" data-cat-action="mat-prix" data-idx="${i}"></td>
-      <td class="ctr"><input type="checkbox" ${m.parc ? 'checked' : ''} data-cat-action="mat-parc" data-idx="${i}"></td>
-      <td class="ctr"><button class="subtle icon-only" data-cat-action="mat-delete" data-idx="${i}">✕</button></td>
+      <td><input type="text" value="${escapeHtml(m.nom)}" data-cat-action="mat-nom" data-idx="${i}" ${ro}></td>
+      <td><input type="text" value="${escapeHtml(m.cat)}" data-cat-action="mat-cat" data-idx="${i}" ${ro}></td>
+      <td class="num"><input type="text" class="num rate" value="${m.prix}" data-cat-action="mat-prix" data-idx="${i}" ${ro}></td>
+      <td class="ctr"><input type="checkbox" ${m.parc ? 'checked' : ''} data-cat-action="mat-parc" data-idx="${i}" ${ro}></td>
+      <td class="ctr">${matReadonly ? '' : `<button class="subtle icon-only" data-cat-action="mat-delete" data-idx="${i}">✕</button>`}</td>
     </tr>`).join('');
+  // Mettre à jour aussi le statut sync et masquer le bouton "Ajouter" si readonly
+  const addBtn = document.getElementById('add-materiel-catalog');
+  if (addBtn) addBtn.style.display = matReadonly ? 'none' : '';
+  updateSheetsSyncUI();
 
   const tbodyF = document.getElementById('catalog-frais');
   tbodyF.innerHTML = params.frais.map((f, i) => `
@@ -2708,6 +2715,25 @@ const SYNC_CONFIG = {
 let RUNTIME_TOKEN = null;
 
 // ============================================================
+//  CONFIG SHEETS — synchro du catalogue matériel depuis Google Sheets
+// ============================================================
+// Pour activer :
+//   1. Crée un Google Sheets avec les colonnes : id, nom, categorie, prix_jour, dispo_parc
+//   2. Fichier > Partager > Publier sur le Web > choisir "Valeurs séparées par des virgules (.csv)" → publier
+//   3. Copie l'URL générée et colle-la ci-dessous
+//   4. Mets enabled à true
+//
+// Voir SETUP.md section "Inventaire matériel via Google Sheets"
+
+const SHEETS_CONFIG = {
+  enabled: true,
+  csvUrl: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vTsH5NRRUZHQHe3uNjuRuREmO5rztTEXnGCQc-75W_vlVwqxtYuh5hK9nzejbIICOQ-uWb4znfWSRnJ/pub?gid=2007774556&single=true&output=csv',
+};
+
+let lastSheetsSync = null;   // timestamp de la dernière sync réussie
+
+
+// ============================================================
 //  RÉCEPTION DU TOKEN DEPUIS LA PAGE PARENTE (Squarespace)
 // ============================================================
 window.addEventListener('message', (event) => {
@@ -2854,6 +2880,124 @@ saveParams = function() { _origSaveParams.apply(this, arguments); scheduleSync()
 const _origSaveDevisList = saveDevisList;
 saveDevisList = function() { _origSaveDevisList.apply(this, arguments); scheduleSync(); };
 
+
+// ============================================================
+//  SYNC INVENTAIRE MATÉRIEL (Google Sheets → app)
+// ============================================================
+
+async function fetchInventaireFromSheets() {
+  if (!SHEETS_CONFIG.enabled || !SHEETS_CONFIG.csvUrl || SHEETS_CONFIG.csvUrl.startsWith('METTRE_ICI')) {
+    return null;
+  }
+  try {
+    // Anti-cache : ajouter un timestamp pour forcer un fetch frais
+    const url = SHEETS_CONFIG.csvUrl + (SHEETS_CONFIG.csvUrl.includes('?') ? '&' : '?') + '_ts=' + Date.now();
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const csv = await res.text();
+    return parseCsvMateriel(csv);
+  } catch (err) {
+    console.warn('[Inventaire] Erreur fetch CSV:', err.message);
+    return null;
+  }
+}
+
+// Parser CSV minimaliste qui gère les guillemets
+function parseCsvLine(line) {
+  const out = [];
+  let cur = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inQuotes) {
+      if (c === '"' && line[i+1] === '"') { cur += '"'; i++; }
+      else if (c === '"') inQuotes = false;
+      else cur += c;
+    } else {
+      if (c === '"') inQuotes = true;
+      else if (c === ',') { out.push(cur); cur = ''; }
+      else cur += c;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+function parseCsvMateriel(csv) {
+  const lines = csv.split(/\r?\n/).filter(l => l.trim().length > 0);
+  if (lines.length < 2) return [];
+  const headers = parseCsvLine(lines[0]).map(h => h.trim().toLowerCase());
+  const idxId = headers.indexOf('id');
+  const idxNom = headers.indexOf('nom');
+  const idxCat = headers.indexOf('categorie');
+  const idxPrix = headers.indexOf('prix_jour');
+  const idxParc = headers.indexOf('dispo_parc');
+  if (idxId < 0 || idxNom < 0 || idxCat < 0 || idxPrix < 0 || idxParc < 0) {
+    console.warn('[Inventaire] CSV mal formé : colonnes manquantes. Attendu: id, nom, categorie, prix_jour, dispo_parc');
+    return null;
+  }
+  const items = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cells = parseCsvLine(lines[i]);
+    const id = (cells[idxId] || '').trim();
+    if (!id) continue;
+    const prix = parseFloat((cells[idxPrix] || '0').replace(',', '.').replace(/[^\d.-]/g, ''));
+    const parcStr = (cells[idxParc] || '').trim().toUpperCase();
+    const parc = parcStr === 'TRUE' || parcStr === 'VRAI' || parcStr === '1' || parcStr === 'OUI' || parcStr === 'YES';
+    items.push({
+      id,
+      nom: (cells[idxNom] || '').trim(),
+      cat: (cells[idxCat] || 'Autre').trim(),
+      prix: isFinite(prix) ? prix : 0,
+      parc,
+    });
+  }
+  return items;
+}
+
+async function syncInventaireOnStart() {
+  if (!SHEETS_CONFIG.enabled) return;
+  const fresh = await fetchInventaireFromSheets();
+  if (!fresh) return;
+  if (fresh.length === 0) {
+    console.warn('[Inventaire] CSV vide, on garde le catalogue actuel');
+    return;
+  }
+  // Remplace le catalogue
+  params.materiel = fresh;
+  lastSheetsSync = Date.now();
+  // Sauvegarde locale (sans déclencher de sync Gist, le matos vient de Sheets)
+  _origSaveParams();
+  // Si on est sur la vue Paramètres, re-render le tableau
+  if (document.getElementById('view-params').classList.contains('active')) {
+    renderParams();
+  }
+  // Re-render le récap (en cas de prix changé sur des items du devis en cours)
+  renderDevis();
+  updateSheetsSyncUI();
+  toast('Inventaire matériel synchronisé (' + fresh.length + ' items)');
+}
+
+function updateSheetsSyncUI() {
+  const el = document.getElementById('sheets-sync-status');
+  if (!el) return;
+  if (!SHEETS_CONFIG.enabled) {
+    el.textContent = 'Édition libre (Sheets non configuré)';
+    el.className = 'help-text';
+    return;
+  }
+  if (lastSheetsSync) {
+    const d = new Date(lastSheetsSync);
+    const time = d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+    el.innerHTML = '<strong>Lecture seule</strong> · Synchronisé depuis Google Sheets à ' + time + '. Modifie le Sheets puis recharge la page.';
+    el.className = 'help-text';
+  } else {
+    el.textContent = 'Synchronisation depuis Sheets en attente…';
+    el.className = 'help-text';
+  }
+}
+
+
 // Au chargement : si Gist activé, on récupère le state distant et on l'applique si plus récent
 async function syncOnStart() {
   if (!SYNC_CONFIG.enabled) {
@@ -2933,7 +3077,9 @@ async function initApp() {
   // 3. Premier rendu (avec données locales)
   renderDevis();
   showView('devis');
-  // 4. Si sync activée, récupérer le distant et re-rendre si besoin
+  // 4. Synchroniser l'inventaire matériel depuis Google Sheets (avant le Gist)
+  await syncInventaireOnStart();
+  // 5. Si sync Gist activée, récupérer le distant et re-rendre si besoin
   await syncOnStart();
 }
 
