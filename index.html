@@ -2697,6 +2697,2891 @@ document.getElementById('btn-theme').addEventListener('click', () => {
 //   5. Renseigne ci-dessous :
 
 const SYNC_CONFIG = {
+  enabled: true,                          // active la sync
+  gistId: 'cfaf96d58812e4f92bce4c1321a0817f',       // ID du Gist privé (modifiable ici, c'est public sans risque)
+  filename: 'mcp-data.json',
+  // Le token n'est plus dans ce fichier — il est injecté par la page parente Squarespace
+  // via postMessage. Voir le guide SETUP.md.
+};
+
+// Le token est reçu dynamiquement de la page parente
+let RUNTIME_TOKEN = null;
+
+// ============================================================
+//  RÉCEPTION DU TOKEN DEPUIS LA PAGE PARENTE (Squarespace)
+// ============================================================
+window.addEventListener('message', (event) => {
+  // On accepte les messages de n'importe quelle origine — la page parente
+  // est forcément Squarespace qui contient l'iframe, et le pire qu'un attaquant
+  // puisse faire c'est nous envoyer un faux token (qui sera rejeté par GitHub).
+  if (!event.data || event.data.type !== 'mcp-token') return;
+  if (typeof event.data.token !== 'string' || !event.data.token.startsWith('github_pat_')) return;
+  const wasEmpty = !RUNTIME_TOKEN;
+  RUNTIME_TOKEN = event.data.token;
+  updateSyncUI();
+  // Si on vient de recevoir le token et que sync est activée, on tente une sync initiale
+  if (wasEmpty && SYNC_CONFIG.enabled) {
+    syncOnStart();
+  }
+});
+
+// Au chargement, demander à la page parente de nous envoyer le token
+function requestTokenFromParent() {
+  if (window.parent && window.parent !== window) {
+    try {
+      window.parent.postMessage({ type: 'mcp-need-token' }, '*');
+    } catch (e) {
+      // Si on est en standalone (pas dans une iframe), pas grave
+    }
+  }
+}
+// On le fait dès que possible, puis on retente quelques fois au cas où la page parente
+// n'aurait pas encore monté son listener
+requestTokenFromParent();
+setTimeout(requestTokenFromParent, 200);
+setTimeout(requestTokenFromParent, 1000);
+setTimeout(requestTokenFromParent, 3000);
+
+
+
+// ============================================================
+//  SYNC GIST
+// ============================================================
+
+const sync = {
+  state: 'local',            // 'local' | 'syncing' | 'synced' | 'error'
+  lastError: null,
+  pendingTimeout: null,
+  saveDebounceMs: 1500,
+  apiBase: 'https://api.github.com/gists',
+};
+
+function updateSyncUI() {
+  const el = document.getElementById('sync-indicator');
+  if (!el) return;
+  el.className = 'sync-indicator ' + sync.state;
+  const labels = {
+    local: RUNTIME_TOKEN ? 'local' : 'attente token',
+    syncing: 'sync…',
+    synced: 'synchro OK',
+    error: 'erreur sync'
+  };
+  document.getElementById('sync-label').textContent = labels[sync.state] || sync.state;
+  el.title = sync.state === 'error' && sync.lastError
+    ? 'Erreur : ' + sync.lastError + ' (les modifs restent en local)'
+    : sync.state === 'synced' ? 'Données synchronisées avec le Gist'
+    : sync.state === 'syncing' ? 'Synchronisation en cours…'
+    : SYNC_CONFIG.enabled ? 'En attente…' : 'Sync Gist désactivée (mode local uniquement)';
+}
+
+async function gistFetch() {
+  if (!SYNC_CONFIG.enabled) return null;
+  if (!RUNTIME_TOKEN) {
+    sync.state = 'local'; sync.lastError = 'Token non reçu de la page parente';
+    updateSyncUI();
+    return null;
+  }
+  sync.state = 'syncing'; updateSyncUI();
+  try {
+    const res = await fetch(`${sync.apiBase}/${SYNC_CONFIG.gistId}`, {
+      headers: { 'Authorization': 'Bearer ' + RUNTIME_TOKEN, 'Accept': 'application/vnd.github+json' },
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    const file = data.files && data.files[SYNC_CONFIG.filename];
+    if (!file) throw new Error('Fichier introuvable dans le Gist');
+    let content;
+    try {
+      content = JSON.parse(file.content || '{}');
+    } catch (e) {
+      throw new Error('JSON invalide dans le Gist');
+    }
+    sync.state = 'synced'; sync.lastError = null; updateSyncUI();
+    return content;
+  } catch (err) {
+    sync.state = 'error'; sync.lastError = err.message; updateSyncUI();
+    return null;
+  }
+}
+
+async function gistPush(payload) {
+  if (!SYNC_CONFIG.enabled) return;
+  if (!RUNTIME_TOKEN) {
+    sync.state = 'local'; sync.lastError = 'Token non reçu de la page parente';
+    updateSyncUI();
+    return;
+  }
+  sync.state = 'syncing'; updateSyncUI();
+  try {
+    const body = {
+      files: {
+        [SYNC_CONFIG.filename]: { content: JSON.stringify(payload, null, 2) }
+      }
+    };
+    const res = await fetch(`${sync.apiBase}/${SYNC_CONFIG.gistId}`, {
+      method: 'PATCH',
+      headers: { 'Authorization': 'Bearer ' + RUNTIME_TOKEN, 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    sync.state = 'synced'; sync.lastError = null; updateSyncUI();
+  } catch (err) {
+    sync.state = 'error'; sync.lastError = err.message; updateSyncUI();
+  }
+}
+
+// Debounced push : on attend 1.5 s sans modification avant d'envoyer
+function scheduleSync() {
+  if (!SYNC_CONFIG.enabled) return;
+  if (sync.pendingTimeout) clearTimeout(sync.pendingTimeout);
+  sync.pendingTimeout = setTimeout(() => {
+    sync.pendingTimeout = null;
+    const payload = {
+      version: 3,
+      updatedAt: Date.now(),
+      params,
+      devisList,
+      currentDevisId: devis ? devis.id : null,
+    };
+    gistPush(payload);
+  }, sync.saveDebounceMs);
+}
+
+// On wrappe les fonctions de sauvegarde existantes pour déclencher la sync
+const _origSaveParams = saveParams;
+saveParams = function() { _origSaveParams.apply(this, arguments); scheduleSync(); };
+
+const _origSaveDevisList = saveDevisList;
+saveDevisList = function() { _origSaveDevisList.apply(this, arguments); scheduleSync(); };
+
+// Au chargement : si Gist activé, on récupère le state distant et on l'applique si plus récent
+async function syncOnStart() {
+  if (!SYNC_CONFIG.enabled) {
+    updateSyncUI();
+    return;
+  }
+  const remote = await gistFetch();
+  if (!remote || !remote.updatedAt) return;
+  const localUpdatedAt = Math.max(
+    ...devisList.map(d => d.updatedAt || 0),
+    0
+  );
+  // Si le remote est plus récent que tout ce qu'on a localement, on le prend
+  if (remote.updatedAt > localUpdatedAt) {
+    if (remote.params) params = remote.params;
+    if (remote.devisList) devisList = remote.devisList;
+    if (!params.templates) params.templates = [];
+    // Sauvegarder en local (sans déclencher de sync)
+    _origSaveParams();
+    _origSaveDevisList();
+    if (remote.currentDevisId) {
+      const found = devisList.find(d => d.id === remote.currentDevisId);
+      if (found) { devis = found; saveCurrentId(devis.id); }
+    }
+    renderDevis();
+    toast('Devis mis à jour depuis le serveur');
+  } else if (localUpdatedAt > (remote.updatedAt || 0)) {
+    // Local plus récent : on pousse
+    scheduleSync();
+  }
+}
+
+// Force sync : bouton manuel pour récupérer le distant ou pousser
+async function forceSyncPull() {
+  if (!SYNC_CONFIG.enabled) {
+    toast('Sync désactivée — voir config dans le code');
+    return;
+  }
+  const remote = await gistFetch();
+  if (!remote) {
+    toast('Impossible de récupérer le distant');
+    return;
+  }
+  if (!remote.updatedAt) {
+    toast('Le Gist est vide, rien à récupérer');
+    return;
+  }
+  if (remote.params) params = remote.params;
+  if (remote.devisList) devisList = remote.devisList;
+  if (!params.templates) params.templates = [];
+  _origSaveParams();
+  _origSaveDevisList();
+  if (remote.currentDevisId) {
+    const found = devisList.find(d => d.id === remote.currentDevisId);
+    if (found) { devis = found; saveCurrentId(devis.id); }
+  }
+  renderDevis();
+  toast('Devis rechargés depuis le serveur');
+}
+
+// Cliquer sur l'indicateur force un pull
+setTimeout(() => {
+  const el = document.getElementById('sync-indicator');
+  if (el) el.addEventListener('click', forceSyncPull);
+}, 0);
+
+// ============================================================
+//  Initialisation finale (après auth)
+// ============================================================
+
+async function initApp() {
+  // 1. Charger l'état local
+  initCurrentDevis();
+  setupSearchableSelects();
+  // 2. Mettre à jour l'UI de sync
+  updateSyncUI();
+  // 3. Premier rendu (avec données locales)
+  renderDevis();
+  showView('devis');
+  // 4. Si sync activée, récupérer le distant et re-rendre si besoin
+  await syncOnStart();
+}
+
+// Démarrage direct (le mot de passe est géré côté Squarespace)
+initApp();
+
+
+// ===== INIT (différé jusqu'à auth) =====
+// L'app n'est initialisée qu'après authentification réussie.
+// Voir initApp() ci-dessus.
+
+</script>
+</body>
+</html>  color: var(--text);
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  letter-spacing: -0.005em;
+}
+
+/* ===== Header ===== */
+header.app-header {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 14px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  gap: 14px;
+}
+.app-title {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+  flex: 0 0 auto;
+}
+.app-title .logo {
+  width: 36px; height: 36px;
+  background: var(--text);
+  color: var(--surface);
+  border-radius: 2px;
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.02em;
+  flex-shrink: 0;
+}
+.app-title h1 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  text-transform: uppercase;
+}
+.app-title .subtitle {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 2px;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 320px;
+}
+.header-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+/* ===== Boutons ===== */
+button, .btn {
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 8px 14px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+button:hover, .btn:hover {
+  background: var(--surface-2);
+  border-color: var(--text);
+}
+button:active, .btn:active { transform: translateY(1px); }
+button:disabled, .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+button.primary, .btn.primary {
+  background: var(--accent); color: var(--accent-text); border-color: var(--accent);
+}
+button.primary:hover, .btn.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+button.subtle { border-color: transparent; background: transparent; color: var(--text-muted); padding: 6px 10px; }
+button.subtle:hover { background: var(--surface-2); color: var(--text); border-color: transparent; }
+button.danger { color: var(--danger); border-color: var(--border); }
+button.danger:hover { background: var(--danger-bg); border-color: var(--danger); }
+button.icon-only { padding: 6px 9px; }
+.theme-toggle { padding: 6px 10px; font-size: 16px; line-height: 1; border-color: var(--border); }
+
+/* ===== Inputs ===== */
+input[type="text"], input[type="number"], input[type="email"], input[type="search"], textarea, select {
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  width: 100%;
+  outline: none;
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+input:focus, textarea:focus, select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-bg);
+}
+input::placeholder { color: var(--text-dim); }
+
+/* ===== Range / slider ===== */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  outline: none;
+  padding: 0;
+  border: none;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  background: var(--accent);
+  border-radius: 50%;
+  cursor: pointer;
+  border: 2px solid var(--surface);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+input[type="range"]::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  background: var(--accent);
+  border-radius: 50%;
+  cursor: pointer;
+  border: 2px solid var(--surface);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+input[type="range"]:focus::-webkit-slider-thumb { box-shadow: 0 0 0 1px var(--accent), 0 0 0 4px var(--accent-bg); }
+
+/* ===== Layout ===== */
+main {
+  max-width: 1320px;
+  margin: 0 auto;
+  padding: 24px;
+}
+.view { display: none; }
+.view.active { display: block; }
+.layout-2col {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(340px, 1fr);
+  gap: 22px;
+  align-items: start;
+}
+@media (max-width: 980px) {
+  .layout-2col { grid-template-columns: 1fr; }
+}
+
+/* ===== Cards ===== */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 18px 20px;
+  margin-bottom: 14px;
+}
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+  gap: 10px;
+}
+.card-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  margin: 0;
+  flex: 1;
+  min-width: 0;
+}
+.card-title::before {
+  content: "";
+  display: inline-block;
+  width: 16px;
+  height: 1px;
+  background: var(--accent);
+  vertical-align: middle;
+  margin-right: 10px;
+  margin-bottom: 3px;
+}
+.card-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+/* ===== Forms ===== */
+.form-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.form-row.three { grid-template-columns: 1fr 1fr 1fr; }
+.form-row.single { grid-template-columns: 1fr; }
+label.field { display: block; }
+label.field span {
+  display: block;
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 500;
+}
+
+/* ===== Tables ===== */
+.line-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.line-table thead th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--text-dim);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 8px 6px;
+  border-bottom: 1px solid var(--border);
+}
+.line-table thead th.num { text-align: right; }
+.line-table thead th.ctr { text-align: center; }
+.line-table tbody td { padding: 7px 6px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.line-table tbody tr:last-child td { border-bottom: none; }
+.line-table tbody td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.line-table tbody td.ctr { text-align: center; }
+.line-table tbody td.total { font-weight: 600; font-variant-numeric: tabular-nums; }
+.line-table input, .line-table select { padding: 5px 8px; font-size: 13px; }
+.line-table input.num { text-align: right; font-variant-numeric: tabular-nums; }
+.line-table input.qty { max-width: 70px; }
+.line-table input.rate { max-width: 90px; }
+
+.col-poste { width: auto; }
+.col-source { width: 110px; }
+.col-rate { width: 95px; }
+.col-qty { width: 75px; }
+.col-total { width: 90px; }
+.col-action { width: 36px; }
+.line-table.materiel .col-source { width: 130px; }
+
+.empty-row td { color: var(--text-dim); font-style: italic; text-align: center; padding: 18px 6px; font-size: 12px; }
+
+/* ===== Badges ===== */
+.badge {
+  display: inline-block;
+  padding: 3px 8px;
+  font-size: 10px;
+  font-weight: 600;
+  border-radius: 2px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.badge.interne { background: var(--success-bg); color: var(--success); }
+.badge.externe { background: var(--warning-bg); color: var(--warning); }
+.badge.parc { background: var(--accent-bg); color: var(--accent); }
+.badge.loue { background: var(--warning-bg); color: var(--warning); }
+.badge.libre { background: var(--surface-2); color: var(--text-muted); }
+select.source-select {
+  padding: 4px 6px; font-size: 11px; background: var(--surface);
+  text-transform: uppercase; letter-spacing: 0.04em; font-weight: 500;
+}
+
+/* ===== Récap ===== */
+.recap-sticky { position: sticky; top: 88px; }
+.recap-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 20px 22px; }
+.recap-card .card-title { margin-bottom: 16px; }
+.recap-line {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 5px 0;
+  font-size: 13px;
+}
+.recap-line .lbl { color: var(--text-muted); }
+.recap-line .lbl small { color: var(--text-dim); font-weight: 400; font-size: 11px; }
+.recap-line .val { font-variant-numeric: tabular-nums; }
+.recap-line.sep { border-top: 1px solid var(--border); margin-top: 6px; padding-top: 12px; }
+.recap-line.subtotal { font-weight: 600; }
+.recap-line.subtotal .lbl { color: var(--text); }
+.recap-total {
+  margin-top: 16px;
+  padding: 16px 18px;
+  background: var(--text);
+  color: var(--surface);
+  border-radius: var(--radius);
+  border-left: 3px solid var(--accent);
+}
+:root[data-theme="dark"] .recap-total {
+  background: var(--accent); color: var(--accent-text); border-left: 3px solid var(--text);
+}
+.recap-total .lbl { font-size: 10px; text-transform: uppercase; letter-spacing: 0.12em; opacity: 0.7; font-weight: 500; }
+.recap-total .val { font-size: 30px; font-weight: 700; letter-spacing: -0.02em; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.recap-total .ttc { font-size: 11px; opacity: 0.7; letter-spacing: 0.04em; margin-top: 6px; font-variant-numeric: tabular-nums; }
+
+.marge-pill {
+  margin-top: 12px;
+  padding: 11px 14px;
+  background: var(--success-bg);
+  color: var(--success);
+  border-radius: var(--radius);
+  font-size: 13px;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  border-left: 3px solid var(--success);
+}
+.marge-pill.bad { background: var(--danger-bg); color: var(--danger); border-left-color: var(--danger); }
+.marge-pill.warn { background: var(--warning-bg); color: var(--warning); border-left-color: var(--warning); }
+.marge-pill strong { font-size: 17px; font-variant-numeric: tabular-nums; font-weight: 700; }
+
+.prix-final-card {
+  margin-top: 12px;
+  padding: 14px 16px;
+  background: var(--surface-2);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+}
+.prix-final-card .lbl {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-weight: 500;
+}
+.prix-final-card input {
+  font-size: 17px; font-weight: 700; text-align: right;
+  font-variant-numeric: tabular-nums; background: var(--surface);
+}
+.prix-final-card .delta { font-size: 11px; margin-top: 8px; color: var(--text-muted); letter-spacing: 0.02em; }
+
+/* ===== Slider de marge ===== */
+.marge-control {
+  margin-top: 12px;
+  padding: 12px 14px;
+  background: var(--surface-2);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+}
+.marge-control .lbl {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em;
+  color: var(--text-muted); font-weight: 500;
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 10px;
+}
+.marge-control .marge-value {
+  font-size: 15px; font-weight: 700; color: var(--text);
+  font-variant-numeric: tabular-nums; letter-spacing: 0;
+}
+.marge-control .marge-row {
+  display: grid;
+  grid-template-columns: 1fr 60px;
+  gap: 10px;
+  align-items: center;
+}
+.marge-control input[type="number"] {
+  text-align: right; font-variant-numeric: tabular-nums; font-weight: 600;
+}
+.marge-control .marge-ticks {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 6px;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+/* ===== KPI boxes ===== */
+.params-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+.kpi-box {
+  padding: 14px 16px; background: var(--surface-2); border-radius: var(--radius);
+  border-left: 3px solid var(--accent);
+}
+.kpi-box .kpi-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--text-muted); font-weight: 500; }
+.kpi-box .kpi-value { font-size: 22px; font-weight: 700; margin-top: 4px; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+.kpi-box .kpi-hint { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
+
+/* ===== Tabs ===== */
+.tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 20px;
+  overflow-x: auto;
+}
+.tab {
+  padding: 10px 18px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-muted);
+  border: none;
+  background: transparent;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  border-radius: 0;
+  white-space: nowrap;
+}
+.tab:hover { color: var(--text); border-bottom-color: var(--border-strong); }
+.tab.active { color: var(--text); border-bottom-color: var(--accent); }
+
+/* ===== Toast ===== */
+.toast {
+  position: fixed; bottom: 24px; right: 24px;
+  background: var(--text); color: var(--surface);
+  padding: 11px 18px; border-radius: var(--radius); font-size: 13px;
+  box-shadow: var(--shadow-md); z-index: 100;
+  opacity: 0; transform: translateY(8px);
+  transition: opacity 0.2s, transform 0.2s;
+  pointer-events: none; letter-spacing: 0.01em;
+}
+.toast.show { opacity: 1; transform: translateY(0); }
+
+/* ===== Animations ===== */
+@keyframes flash-row {
+  0% { background: var(--accent-bg); }
+  100% { background: transparent; }
+}
+.flash { animation: flash-row 0.8s ease-out; }
+
+.help-text { font-size: 12px; color: var(--text-muted); margin: 4px 0 0; line-height: 1.6; }
+
+/* ===== Add row ===== */
+.add-row { margin-top: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.add-row select { max-width: 300px; }
+.section-total-line {
+  font-size: 11px; color: var(--text-muted);
+  text-transform: uppercase; letter-spacing: 0.06em;
+}
+.section-total-line strong { color: var(--text); font-weight: 700; font-variant-numeric: tabular-nums; }
+
+/* ===== Modal ===== */
+dialog.modal {
+  border: none; padding: 0; background: transparent;
+  max-width: 500px; width: 90%;
+}
+dialog.modal.wide { max-width: 800px; }
+dialog.modal::backdrop { background: rgba(0,0,0,0.6); backdrop-filter: blur(2px); }
+.modal-inner {
+  background: var(--surface);
+  border-radius: var(--radius-lg);
+  padding: 22px;
+  border: 1px solid var(--border);
+  max-height: 80vh;
+  overflow: auto;
+}
+.modal-inner h3 {
+  margin: 0 0 12px; font-size: 14px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.06em;
+}
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+
+/* ===== Devis list modal ===== */
+.devis-list { list-style: none; padding: 0; margin: 0; }
+.devis-list li {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 8px;
+  align-items: center;
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+.devis-list li:hover { border-color: var(--text-muted); background: var(--surface-2); }
+.devis-list li.current { border-color: var(--accent); border-left: 3px solid var(--accent); }
+.devis-list .di-main { min-width: 0; }
+.devis-list .di-name { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.devis-list .di-name.empty { color: var(--text-dim); font-weight: 400; font-style: italic; }
+.devis-list .di-meta { font-size: 11px; color: var(--text-muted); margin-top: 2px; letter-spacing: 0.02em; }
+.devis-list .di-total { font-weight: 700; font-variant-numeric: tabular-nums; font-size: 14px; }
+.devis-list .di-actions { display: flex; gap: 4px; }
+.devis-list .di-actions button { padding: 5px 8px; font-size: 12px; }
+
+/* ===== Searchable select ===== */
+.searchable-select {
+  position: relative;
+  width: 100%;
+  max-width: 360px;
+}
+.searchable-select input {
+  width: 100%;
+}
+.ss-dropdown {
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 0;
+  right: 0;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-md);
+  max-height: 300px;
+  overflow-y: auto;
+  z-index: 30;
+  display: none;
+}
+.searchable-select.open .ss-dropdown { display: block; }
+.ss-group-label {
+  padding: 6px 12px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+}
+.ss-option {
+  padding: 8px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+}
+.ss-option:hover, .ss-option.highlighted { background: var(--accent-bg); color: var(--accent); }
+.ss-option:last-child { border-bottom: none; }
+.ss-no-match { padding: 12px; text-align: center; font-style: italic; color: var(--text-dim); font-size: 12px; }
+
+/* ===== Multi-select matériel modal ===== */
+.multi-mat-search { margin-bottom: 12px; }
+.multi-mat-list {
+  max-height: 360px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.multi-mat-cat-label {
+  padding: 8px 12px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+.multi-mat-item {
+  display: grid;
+  grid-template-columns: 24px 1fr auto auto;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  align-items: center;
+  cursor: pointer;
+}
+.multi-mat-item:last-child { border-bottom: none; }
+.multi-mat-item:hover { background: var(--surface-2); }
+.multi-mat-item input[type="checkbox"] { margin: 0; width: auto; }
+.multi-mat-item .mat-name { font-size: 13px; }
+.multi-mat-item .mat-price { font-size: 12px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.multi-mat-item .mat-source-chip { font-size: 10px; padding: 2px 6px; border-radius: 2px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+.multi-mat-item.checked { background: var(--accent-bg); }
+:root[data-theme="dark"] .multi-mat-item.checked { background: var(--surface-2); border-left: 3px solid var(--accent); }
+.multi-mat-summary {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+  display: flex;
+  justify-content: space-between;
+}
+
+/* ===== Templates ===== */
+.template-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 10px;
+}
+.template-card {
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+.template-card:hover { border-color: var(--accent); }
+.template-card h4 { margin: 0 0 4px; font-size: 13px; font-weight: 600; }
+.template-card p { margin: 0; font-size: 11px; color: var(--text-muted); line-height: 1.5; }
+
+/* ===== Completion warnings ===== */
+.completion-warnings {
+  margin-top: 12px;
+  padding: 11px 14px;
+  background: var(--warning-bg);
+  color: var(--warning);
+  border-radius: var(--radius);
+  font-size: 12px;
+  border-left: 3px solid var(--warning);
+}
+.completion-warnings ul { margin: 4px 0 0; padding-left: 18px; }
+.completion-warnings li { margin: 2px 0; }
+.completion-warnings.hidden { display: none; }
+
+/* ===== Sélection ===== */
+::selection { background: var(--accent); color: var(--accent-text); }
+
+/* ===== Scrollbar ===== */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* ===== Impression PDF ===== */
+@media print {
+  header.app-header, .header-actions, .add-row, .card-actions,
+  button, dialog, .toast, #view-params, .recap-sticky, .marge-control,
+  .prix-final-card, .col-action, .completion-warnings { display: none !important; }
+  body { background: white; color: black; }
+  main { max-width: 100%; padding: 12px; }
+  .card { border: 1px solid #ccc; box-shadow: none; page-break-inside: avoid; }
+  .recap-card { display: block; }
+  .recap-total { background: white !important; color: black !important; border: 2px solid black; }
+  .recap-total .val { color: black; }
+  .badge { border: 1px solid currentColor; }
+  .print-header {
+    display: block !important;
+    padding: 16px 0;
+    border-bottom: 2px solid black;
+    margin-bottom: 20px;
+  }
+  .print-header h1 { font-size: 22px; margin: 0; }
+  .print-header .ph-meta { font-size: 12px; color: #555; margin-top: 6px; }
+  .layout-2col { grid-template-columns: 1fr !important; }
+}
+.print-header { display: none; }
+
+
+/* ===== Indicateur de sync ===== */
+.sync-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  font-size: 11px;
+  border-radius: var(--radius);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.sync-indicator .sync-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--text-dim);
+}
+.sync-indicator.synced .sync-dot { background: var(--success); }
+.sync-indicator.syncing .sync-dot {
+  background: var(--warning);
+  animation: pulse 1s ease-in-out infinite;
+}
+.sync-indicator.error .sync-dot { background: var(--danger); }
+.sync-indicator.local .sync-dot { background: var(--text-dim); }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+</style>
+</head>
+<body>
+
+<script>
+(function() {
+  try {
+    var t = localStorage.getItem('calc-mcp-theme');
+    if (!t && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) t = 'dark';
+    if (t === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
+  } catch (e) {}
+})();
+</script>
+<div class="print-header">
+  <h1 id="print-projet-nom">Devis</h1>
+  <div class="ph-meta" id="print-projet-meta"></div>
+</div>
+
+<header class="app-header">
+  <div class="app-title">
+    <div class="logo">MCP</div>
+    <div>
+      <h1>Calculateur</h1>
+      <div class="subtitle" id="header-subtitle">Nouveau devis</div>
+    </div>
+  </div>
+  <div class="header-actions">
+    <button id="btn-theme" class="theme-toggle" title="Basculer clair / sombre" aria-label="Basculer le thème">◐</button>
+    <button id="btn-view-devis" class="primary">Devis</button>
+    <button id="btn-view-params">Paramètres</button>
+    <span class="sync-indicator local" id="sync-indicator" title="État de la synchronisation"><span class="sync-dot"></span><span id="sync-label">local</span></span>
+    <button id="btn-devis-list" title="Liste de mes devis">Mes devis</button>
+    <button id="btn-templates" title="Templates de prestations">Templates</button>
+    <button id="btn-new" title="Nouveau devis vierge">Nouveau</button>
+    <button id="btn-duplicate" title="Dupliquer ce devis">Dupliquer</button>
+    <button id="btn-print" title="Imprimer / PDF">Imprimer</button>
+    <button id="btn-export" title="Exporter ce devis en JSON">Exporter</button>
+    <button id="btn-import" title="Importer un fichier">Importer</button>
+    <input type="file" id="file-import" accept=".json" style="display:none">
+  </div>
+</header>
+
+<main>
+
+  <section id="view-devis" class="view active">
+    <div class="layout-2col">
+
+      <div>
+
+        <div class="card">
+          <div class="card-header">
+            <p class="card-title">1 · Projet</p>
+          </div>
+          <div class="form-row">
+            <label class="field">
+              <span>Nom du projet</span>
+              <input type="text" id="proj-nom" placeholder="ex. Captation Convention ACME 2026">
+            </label>
+            <label class="field">
+              <span>Client</span>
+              <input type="text" id="proj-client" placeholder="ex. ACME SA">
+            </label>
+          </div>
+          <div class="form-row" style="margin-top: 10px;">
+            <label class="field">
+              <span>Date / période</span>
+              <input type="text" id="proj-date" placeholder="ex. 12 et 13 mars 2026">
+            </label>
+            <label class="field">
+              <span>Référence commerciale</span>
+              <input type="text" id="proj-ref" placeholder="ex. DEV-2026-042">
+            </label>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <p class="card-title">2 · Pré-production</p>
+            <div class="card-actions">
+              <span class="section-total-line">Sous-total : <strong id="st-preprod">0 €</strong></span>
+              <button class="subtle icon-only" data-clear="preprod" title="Vider cette section">⌫</button>
+            </div>
+          </div>
+          <table class="line-table" id="tbl-preprod">
+            <thead>
+              <tr>
+                <th class="col-poste">Poste</th>
+                <th class="col-source ctr">Source</th>
+                <th class="col-rate num">€/jour</th>
+                <th class="col-qty num">Jours</th>
+                <th class="col-total num">Total</th>
+                <th class="col-action"></th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+          <div class="add-row">
+            <div class="searchable-select" data-target="preprod">
+              <input type="text" class="ss-input" placeholder="Rechercher un poste pré-production…" autocomplete="off">
+              <div class="ss-dropdown"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <p class="card-title">3 · Production (tournage)</p>
+            <div class="card-actions">
+              <span class="section-total-line">Sous-total : <strong id="st-prod">0 €</strong></span>
+              <button class="subtle icon-only" data-clear="prod" title="Vider cette section">⌫</button>
+            </div>
+          </div>
+          <table class="line-table" id="tbl-prod">
+            <thead>
+              <tr>
+                <th class="col-poste">Poste</th>
+                <th class="col-source ctr">Source</th>
+                <th class="col-rate num">€/jour</th>
+                <th class="col-qty num">Jours</th>
+                <th class="col-total num">Total</th>
+                <th class="col-action"></th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+          <div class="add-row">
+            <div class="searchable-select" data-target="prod">
+              <input type="text" class="ss-input" placeholder="Rechercher un poste production…" autocomplete="off">
+              <div class="ss-dropdown"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <p class="card-title">4 · Post-production</p>
+            <div class="card-actions">
+              <span class="section-total-line">Sous-total : <strong id="st-postprod">0 €</strong></span>
+              <button class="subtle icon-only" data-clear="postprod" title="Vider cette section">⌫</button>
+            </div>
+          </div>
+          <table class="line-table" id="tbl-postprod">
+            <thead>
+              <tr>
+                <th class="col-poste">Poste</th>
+                <th class="col-source ctr">Source</th>
+                <th class="col-rate num">€/jour</th>
+                <th class="col-qty num">Jours</th>
+                <th class="col-total num">Total</th>
+                <th class="col-action"></th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+          <div class="add-row">
+            <div class="searchable-select" data-target="postprod">
+              <input type="text" class="ss-input" placeholder="Rechercher un poste post-production…" autocomplete="off">
+              <div class="ss-dropdown"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <p class="card-title">5 · Matériel</p>
+            <div class="card-actions">
+              <span class="section-total-line">Sous-total : <strong id="st-materiel">0 €</strong></span>
+              <button class="subtle icon-only" data-clear="materiel" title="Vider cette section">⌫</button>
+            </div>
+          </div>
+          <table class="line-table materiel" id="tbl-materiel">
+            <thead>
+              <tr>
+                <th class="col-poste">Équipement</th>
+                <th class="col-source ctr">Source</th>
+                <th class="col-rate num">€/jour</th>
+                <th class="col-qty num">Jours</th>
+                <th class="col-total num">Total</th>
+                <th class="col-action"></th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+          <div class="add-row">
+            <div class="searchable-select" data-target="materiel">
+              <input type="text" class="ss-input" placeholder="Rechercher un équipement…" autocomplete="off">
+              <div class="ss-dropdown"></div>
+            </div>
+            <button id="btn-add-multi-mat">+ Ajouter plusieurs</button>
+          </div>
+          <p class="help-text">Cliquez sur <span class="badge parc">parc</span> ou <span class="badge loue">loué</span> pour basculer entre matos interne et sous-location.</p>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <p class="card-title">6 · Frais annexes</p>
+            <div class="card-actions">
+              <span class="section-total-line">Sous-total : <strong id="st-frais">0 €</strong></span>
+              <button class="subtle icon-only" data-clear="frais" title="Vider cette section">⌫</button>
+            </div>
+          </div>
+          <table class="line-table" id="tbl-frais">
+            <thead>
+              <tr>
+                <th class="col-poste">Désignation</th>
+                <th class="col-source ctr">Type</th>
+                <th class="col-rate num">P.U.</th>
+                <th class="col-qty num">Qté</th>
+                <th class="col-total num">Total</th>
+                <th class="col-action"></th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+          <div class="add-row">
+            <div class="searchable-select" data-target="frais">
+              <input type="text" class="ss-input" placeholder="Rechercher un frais…" autocomplete="off">
+              <div class="ss-dropdown"></div>
+            </div>
+            <button id="add-frais-libre-btn" class="subtle">+ Ligne libre</button>
+          </div>
+        </div>
+
+      </div>
+
+      <div>
+        <div class="recap-sticky">
+          <div class="recap-card">
+            <p class="card-title">Récap du devis</p>
+
+            <div class="recap-line"><span class="lbl">Pré-production</span><span class="val" id="r-preprod">0 €</span></div>
+            <div class="recap-line"><span class="lbl">Production</span><span class="val" id="r-prod">0 €</span></div>
+            <div class="recap-line"><span class="lbl">Post-production</span><span class="val" id="r-postprod">0 €</span></div>
+            <div class="recap-line"><span class="lbl">Matériel</span><span class="val" id="r-materiel">0 €</span></div>
+            <div class="recap-line"><span class="lbl">Frais annexes</span><span class="val" id="r-frais">0 €</span></div>
+            <div class="recap-line"><span class="lbl">Frais de structure <small>(<span id="r-jours-prod">0</span> j × <span id="r-cs-jour">130</span> €)</small></span><span class="val" id="r-structure">0 €</span></div>
+
+            <div class="recap-line sep subtotal"><span class="lbl">Coût total</span><span class="val" id="r-cout-total">0 €</span></div>
+
+            <div class="recap-line"><span class="lbl">Marge commerciale</span><span class="val" id="r-marge">0 €</span></div>
+
+            <div class="recap-total">
+              <div class="lbl">Total HT facturé</div>
+              <div class="val" id="r-ht">0 €</div>
+              <div class="ttc" id="r-ttc">Soit 0 € TTC (TVA 20 %)</div>
+            </div>
+
+            <div class="marge-pill" id="marge-pill">
+              <span>Marge nette dégagée</span>
+              <strong id="r-marge-nette">0 €</strong>
+            </div>
+
+            <div class="marge-control">
+              <div class="lbl">
+                <span>Marge commerciale</span>
+                <span class="marge-value"><span id="marge-pct-display">15</span> %</span>
+              </div>
+              <div class="marge-row">
+                <input type="range" id="marge-slider" min="0" max="40" step="1" value="15">
+                <input type="number" id="marge-number" min="0" max="100" step="1" value="15">
+              </div>
+              <div class="marge-ticks">
+                <span>0 %</span>
+                <span>10 %</span>
+                <span>20 %</span>
+                <span>30 %</span>
+                <span>40 %</span>
+              </div>
+            </div>
+
+            <div class="prix-final-card">
+              <div class="lbl">
+                <span>Prix final (à recopier en facturation)</span>
+                <button class="subtle icon-only" id="reset-prix" title="Reprendre le calcul">↻</button>
+              </div>
+              <input type="text" id="prix-final" inputmode="numeric">
+              <div class="delta" id="prix-delta">&nbsp;</div>
+            </div>
+
+            <div class="completion-warnings hidden" id="completion-warnings">
+              <strong>Quelques points à vérifier :</strong>
+              <ul id="completion-list"></ul>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <section id="view-params" class="view">
+
+    <div class="tabs">
+      <button class="tab active" data-tab="structure">Structure</button>
+      <button class="tab" data-tab="postes">Catalogue postes</button>
+      <button class="tab" data-tab="materiel">Catalogue matériel</button>
+      <button class="tab" data-tab="frais">Frais types</button>
+      <button class="tab" data-tab="templates-tab">Templates</button>
+      <button class="tab" data-tab="config">Sauvegarde</button>
+    </div>
+
+    <div class="tab-content" id="tab-structure">
+      <div class="card">
+        <p class="card-title" style="margin-bottom: 14px;">Frais de structure</p>
+        <p class="help-text" style="margin-bottom: 16px;">
+          Ces deux chiffres définissent ton coût de structure par jour. Il s'ajoute automatiquement à chaque devis pour absorber tes charges fixes.
+        </p>
+        <div class="form-row three">
+          <label class="field">
+            <span>Charges fixes annuelles (€ HT/an)</span>
+            <input type="number" id="p-charges" min="0" step="1000">
+          </label>
+          <label class="field">
+            <span>Jours facturables annuels</span>
+            <input type="number" id="p-jours" min="1" step="10">
+          </label>
+          <label class="field">
+            <span>Marge commerciale par défaut (%)</span>
+            <input type="number" id="p-marge" min="0" max="100" step="1">
+          </label>
+        </div>
+        <div class="params-grid" style="margin-top: 18px;">
+          <div class="kpi-box">
+            <div class="kpi-label">Coût de structure / jour</div>
+            <div class="kpi-value" id="kpi-cs">0 €</div>
+            <div class="kpi-hint">charges ÷ jours facturables</div>
+          </div>
+          <div class="kpi-box">
+            <div class="kpi-label">CA minimum de couverture</div>
+            <div class="kpi-value" id="kpi-ca-min">0 €</div>
+            <div class="kpi-hint">pour ne pas perdre d'argent</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="tab-content" id="tab-postes" style="display:none">
+      <div class="card">
+        <div class="card-header">
+          <p class="card-title">Catalogue des postes</p>
+          <button id="add-poste-catalog">+ Ajouter un poste</button>
+        </div>
+        <p class="help-text" style="margin-bottom: 14px;">
+          Un poste "interne" est rémunéré par ta SARL. Un poste "externe" est facturé par un freelance/AE.
+        </p>
+        <table class="line-table">
+          <thead>
+            <tr>
+              <th>Nom du poste</th>
+              <th>Phase</th>
+              <th class="num">Taux interne €/j</th>
+              <th class="num">Taux externe €/j</th>
+              <th class="col-action"></th>
+            </tr>
+          </thead>
+          <tbody id="catalog-postes"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="tab-content" id="tab-materiel" style="display:none">
+      <div class="card">
+        <div class="card-header">
+          <p class="card-title">Catalogue matériel</p>
+          <button id="add-materiel-catalog">+ Ajouter un équipement</button>
+        </div>
+        <p class="help-text" style="margin-bottom: 14px;">
+          Coche "Dispo en parc" si tu possèdes cet équipement, sinon il sera marqué comme loué chez un loueur.
+        </p>
+        <table class="line-table">
+          <thead>
+            <tr>
+              <th>Équipement</th>
+              <th>Catégorie</th>
+              <th class="num">€/jour facturé</th>
+              <th class="ctr">Dispo en parc</th>
+              <th class="col-action"></th>
+            </tr>
+          </thead>
+          <tbody id="catalog-materiel"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="tab-content" id="tab-frais" style="display:none">
+      <div class="card">
+        <div class="card-header">
+          <p class="card-title">Frais types récurrents</p>
+          <button id="add-frais-catalog">+ Ajouter</button>
+        </div>
+        <table class="line-table">
+          <thead>
+            <tr>
+              <th>Désignation</th>
+              <th>Catégorie</th>
+              <th class="num">Prix unitaire</th>
+              <th class="col-action"></th>
+            </tr>
+          </thead>
+          <tbody id="catalog-frais"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="tab-content" id="tab-templates-tab" style="display:none">
+      <div class="card">
+        <div class="card-header">
+          <p class="card-title">Templates de prestations</p>
+          <button id="add-template-catalog">+ Créer un template depuis ce devis</button>
+        </div>
+        <p class="help-text" style="margin-bottom: 14px;">
+          Les templates pré-remplissent un nouveau devis avec une configuration type (équipe, matériel, frais). Crée-en un depuis le devis en cours, puis nomme-le.
+        </p>
+        <table class="line-table">
+          <thead>
+            <tr>
+              <th>Nom du template</th>
+              <th>Description</th>
+              <th>Lignes</th>
+              <th class="col-action"></th>
+            </tr>
+          </thead>
+          <tbody id="catalog-templates"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="tab-content" id="tab-config" style="display:none">
+      <div class="card">
+        <p class="card-title" style="margin-bottom: 14px;">Sauvegarde et partage</p>
+        <p class="help-text" style="margin-bottom: 16px;">
+          Toutes tes données sont stockées dans ce navigateur uniquement. Pour partager avec tes commerciaux, exporte le fichier de paramètres.
+        </p>
+        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+          <button id="export-params" class="primary">Exporter mes paramètres</button>
+          <button id="import-params">Importer un fichier de paramètres</button>
+          <button id="reset-defaults" class="danger">Réinitialiser aux valeurs par défaut</button>
+        </div>
+        <p class="help-text" style="margin-top: 16px;">
+          La réinitialisation n'efface que les paramètres et templates, pas les devis sauvegardés.
+        </p>
+      </div>
+    </div>
+
+  </section>
+
+</main>
+
+<dialog id="confirm-modal" class="modal">
+  <div class="modal-inner">
+    <h3 id="modal-title">Confirmer</h3>
+    <p id="modal-body">Êtes-vous sûr ?</p>
+    <div class="modal-actions">
+      <button id="modal-cancel">Annuler</button>
+      <button id="modal-confirm" class="primary">Confirmer</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="prompt-modal" class="modal">
+  <div class="modal-inner">
+    <h3 id="prompt-title">Saisir</h3>
+    <p id="prompt-body" style="font-size: 13px; color: var(--text-muted);"></p>
+    <input type="text" id="prompt-input" style="margin-top: 8px;">
+    <div class="modal-actions">
+      <button id="prompt-cancel">Annuler</button>
+      <button id="prompt-confirm" class="primary">Valider</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="devis-list-modal" class="modal wide">
+  <div class="modal-inner">
+    <h3>Mes devis</h3>
+    <input type="search" id="devis-list-search" placeholder="Rechercher par nom de projet ou client…" style="margin-bottom: 12px;">
+    <ul class="devis-list" id="devis-list-ul"></ul>
+    <p class="help-text" id="devis-list-info"></p>
+    <div class="modal-actions">
+      <button id="devis-list-close">Fermer</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="multi-mat-modal" class="modal wide">
+  <div class="modal-inner">
+    <h3>Ajouter plusieurs équipements</h3>
+    <input type="search" id="multi-mat-search" placeholder="Filtrer par nom ou catégorie…" class="multi-mat-search">
+    <div class="multi-mat-list" id="multi-mat-list"></div>
+    <div class="multi-mat-summary">
+      <span><strong id="multi-mat-count">0</strong> item(s) sélectionné(s)</span>
+      <span>Total : <strong id="multi-mat-total">0 €</strong> / jour</span>
+    </div>
+    <div class="modal-actions">
+      <button id="multi-mat-cancel">Annuler</button>
+      <button id="multi-mat-confirm" class="primary">Ajouter au devis</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="templates-modal" class="modal wide">
+  <div class="modal-inner">
+    <h3>Choisir un template</h3>
+    <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 14px;">
+      Un template remplit un nouveau devis avec une configuration type. Choisis-en un ci-dessous.
+    </p>
+    <div class="template-grid" id="templates-grid"></div>
+    <div class="modal-actions">
+      <button id="templates-close">Fermer</button>
+    </div>
+  </div>
+</dialog>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ============================================================
+//  CALCULATEUR MCP v2 — JavaScript
+// ============================================================
+
+// ===== DÉFAUTS =====
+
+const DEFAULT_POSTES = [
+  { id: 'pp-gestion', nom: 'Gestion de projet', phase: 'preprod', interne: 550, externe: null },
+  { id: 'pp-reperage', nom: 'Repérage', phase: 'preprod', interne: 350, externe: 400 },
+  { id: 'pp-ideation', nom: 'Idéation / écriture', phase: 'preprod', interne: 450, externe: 520 },
+  { id: 'pp-script', nom: 'Script / storyboard', phase: 'preprod', interne: 400, externe: 460 },
+  { id: 'pp-orga', nom: 'Organisation / régie générale', phase: 'preprod', interne: 350, externe: 400 },
+  { id: 'pp-casting', nom: 'Casting', phase: 'preprod', interne: 300, externe: 350 },
+  { id: 'pr-real', nom: 'Réalisateur', phase: 'prod', interne: 630, externe: 720 },
+  { id: 'pr-chefop', nom: 'Chef opérateur', phase: 'prod', interne: 580, externe: 670 },
+  { id: 'pr-cadreur', nom: 'Cadreur', phase: 'prod', interne: 400, externe: 460 },
+  { id: 'pr-chefelec', nom: 'Chef électricien', phase: 'prod', interne: 420, externe: 480 },
+  { id: 'pr-techvideo', nom: 'Technicien vidéo', phase: 'prod', interne: 420, externe: 480 },
+  { id: 'pr-ingson', nom: 'Ingénieur du son', phase: 'prod', interne: 470, externe: 540 },
+  { id: 'pr-assison', nom: 'Assistant son', phase: 'prod', interne: 330, externe: 380 },
+  { id: 'pr-switcher', nom: 'Monteur vision (switcher)', phase: 'prod', interne: 450, externe: 520 },
+  { id: 'pr-maquillage', nom: 'Maquillage', phase: 'prod', interne: 400, externe: 460 },
+  { id: 'pr-assiprod', nom: 'Assistant prod', phase: 'prod', interne: 370, externe: 430 },
+  { id: 'pr-assireal', nom: 'Assistant réalisateur', phase: 'prod', interne: 370, externe: 430 },
+  { id: 'pr-presentateur', nom: 'Présentateur / journaliste', phase: 'prod', interne: null, externe: 800 },
+  { id: 'pr-acteur-p', nom: 'Acteur principal', phase: 'prod', interne: null, externe: 600 },
+  { id: 'pr-acteur-s', nom: 'Acteur secondaire', phase: 'prod', interne: null, externe: 350 },
+  { id: 'pr-figurant', nom: 'Silhouette / figurant', phase: 'prod', interne: null, externe: 150 },
+  { id: 'po-chefmont', nom: 'Chef monteur', phase: 'postprod', interne: 450, externe: 520 },
+  { id: 'po-etalo', nom: 'Étalonneur', phase: 'postprod', interne: 430, externe: 500 },
+  { id: 'po-montson', nom: 'Monteur son / mixeur', phase: 'postprod', interne: 420, externe: 480 },
+  { id: 'po-assimont', nom: 'Assistant monteur', phase: 'postprod', interne: 330, externe: 380 },
+  { id: 'po-graph', nom: 'Graphiste / motion designer', phase: 'postprod', interne: 450, externe: 520 },
+  { id: 'po-voixoff', nom: 'Voix-off', phase: 'postprod', interne: 350, externe: 400 },
+];
+
+const DEFAULT_MATERIEL = [
+  { id: 'm-fx6', nom: 'Caméra Sony FX6', cat: 'Caméra', prix: 160, parc: true },
+  { id: 'm-fx3', nom: 'Caméra Sony FX3', cat: 'Caméra', prix: 130, parc: true },
+  { id: 'm-a7iv', nom: 'Boîtier hybride Sony A7 IV', cat: 'Caméra', prix: 80, parc: true },
+  { id: 'm-ursa', nom: 'Caméra Blackmagic URSA Broadcast G2', cat: 'Caméra', prix: 170, parc: false },
+  { id: 'm-z90', nom: 'Caméra Sony PXW-Z90', cat: 'Caméra', prix: 100, parc: false },
+  { id: 'm-ptz', nom: 'Caméra PTZ Panasonic AW-HE145', cat: 'Caméra', prix: 240, parc: false },
+  { id: 'm-drone', nom: 'Drone DJI Mavic 4 Pro', cat: 'Caméra', prix: 200, parc: false },
+  { id: 'm-2870gm', nom: 'Objectif Sony FE 28-70 F2 GM', cat: 'Optique', prix: 89, parc: true },
+  { id: 'm-1635gm', nom: 'Objectif Sony FE 16-35 F2.8 GM II', cat: 'Optique', prix: 70, parc: true },
+  { id: 'm-70200', nom: 'Objectif Sony FE 70-200 F2.8 GM II', cat: 'Optique', prix: 80, parc: true },
+  { id: 'm-2414gm', nom: 'Objectif Sony FE 24mm F1.4 GM', cat: 'Optique', prix: 40, parc: true },
+  { id: 'm-8514gm', nom: 'Objectif Sony FE 85mm F1.4 GM II', cat: 'Optique', prix: 60, parc: true },
+  { id: 'm-90macro', nom: 'Objectif Sony FE 90mm F2.8 Macro', cat: 'Optique', prix: 35, parc: true },
+  { id: 'm-irix', nom: 'Kit Irix Cine Directors Set', cat: 'Optique', prix: 350, parc: true },
+  { id: 'm-b4', nom: 'Objectif broadcast Fujinon XA17x7.6 (B4)', cat: 'Optique', prix: 250, parc: true },
+  { id: 'm-trepied-nitro', nom: 'Trépied Manfrotto Nitrotech 608', cat: 'Support', prix: 35, parc: true },
+  { id: 'm-trepied-sachtler', nom: 'Trépied Sachtler Flowtech 75', cat: 'Support', prix: 120, parc: true },
+  { id: 'm-gimbal', nom: 'Gimbal DJI Ronin RS4 Pro', cat: 'Support', prix: 54, parc: true },
+  { id: 'm-slider', nom: 'Slider iFootage Shark S1', cat: 'Support', prix: 30, parc: true },
+  { id: 'm-follow', nom: 'Follow focus Tilta Nucleus M', cat: 'Support', prix: 180, parc: true },
+  { id: 'm-pied-cam', nom: 'Pied caméra avec embase', cat: 'Support', prix: 15, parc: false },
+  { id: 'm-mixpre', nom: 'Enregistreur Sound Devices MixPre-6 II', cat: 'Son', prix: 45, parc: true },
+  { id: 'm-416', nom: 'Micro canon Sennheiser MKH 416', cat: 'Son', prix: 24, parc: false },
+  { id: 'm-cravate', nom: 'Micro cravate Sennheiser MKE 2', cat: 'Son', prix: 18, parc: true },
+  { id: 'm-hf6000', nom: 'Micro HF Sennheiser 6000', cat: 'Son', prix: 90, parc: false },
+  { id: 'm-skm', nom: 'Micro main HF SKM 6000', cat: 'Son', prix: 35, parc: true },
+  { id: 'm-sm7b', nom: 'Micro plateau Shure SM7B', cat: 'Son', prix: 20, parc: true },
+  { id: 'm-iem', nom: 'IEM/IFB Sennheiser EW G4', cat: 'Son', prix: 80, parc: true },
+  { id: 'm-perche', nom: 'Perche K-Tek 3m + bonnette', cat: 'Son', prix: 20, parc: true },
+  { id: 'm-console', nom: 'Console audio Yamaha DM3', cat: 'Son', prix: 125, parc: false },
+  { id: 'm-bose-f1', nom: 'Enceinte + sub Bose F1', cat: 'Son', prix: 140, parc: false },
+  { id: 'm-forza720', nom: 'Projecteur Nanlite Forza 720B II', cat: 'Lumière', prix: 75, parc: true },
+  { id: 'm-forza300', nom: 'Projecteur Nanlite Forza FS 300', cat: 'Lumière', prix: 40, parc: false },
+  { id: 'm-forza60', nom: 'Projecteur Nanlite Forza 60B + softbox', cat: 'Lumière', prix: 20, parc: false },
+  { id: 'm-pavoslim', nom: 'Panneau LED Nanlite PavoSlim 120C', cat: 'Lumière', prix: 35, parc: true },
+  { id: 'm-pavotube', nom: 'Tube LED Nanlite PavoTube II 30X', cat: 'Lumière', prix: 12, parc: true },
+  { id: 'm-astera', nom: 'Uplight Astera AX5 (set 8)', cat: 'Lumière', prix: 150, parc: true },
+  { id: 'm-cstand', nom: 'C-Stand 40"', cat: 'Lumière', prix: 8, parc: true },
+  { id: 'm-pied-lum', nom: 'Pied lumière standard', cat: 'Lumière', prix: 8, parc: false },
+  { id: 'm-atem-hd8', nom: 'Mélangeur Blackmagic ATEM HD8 ISO', cat: 'Régie', prix: 300, parc: false },
+  { id: 'm-vmix', nom: 'Régie PC vMix 8 entrées SDI', cat: 'Régie', prix: 500, parc: false },
+  { id: 'm-atem-panel', nom: 'Pupitre ATEM 1 M/E Advanced 10', cat: 'Régie', prix: 120, parc: true },
+  { id: 'm-hyperdeck', nom: 'Enregistreur HyperDeck Studio', cat: 'Régie', prix: 75, parc: false },
+  { id: 'm-webpres', nom: 'Encodeur Blackmagic Web Presenter 4K', cat: 'Régie', prix: 35, parc: true },
+  { id: 'm-helo', nom: 'Encodeur AJA HELO Plus', cat: 'Régie', prix: 60, parc: true },
+  { id: 'm-peplink', nom: 'Routeur 5G Peplink MAX BR1 Pro', cat: 'Régie', prix: 35, parc: true },
+  { id: 'm-intercom', nom: 'Intercom Vokkero 6 postes', cat: 'Régie', prix: 65, parc: false },
+  { id: 'm-prompteur', nom: 'Prompteur Ikan PT-Elite Pro', cat: 'Régie', prix: 60, parc: true },
+  { id: 'm-fsi240', nom: 'Moniteur référence FSI DM240', cat: 'Moniteur', prix: 100, parc: true },
+  { id: 'm-eizo', nom: 'Moniteur EIZO ColorEdge CG2420', cat: 'Moniteur', prix: 50, parc: true },
+  { id: 'm-feelworld', nom: 'Moniteur client 21.5"', cat: 'Moniteur', prix: 10, parc: true },
+  { id: 'm-pana75', nom: 'Écran Panasonic 75" + pied', cat: 'Moniteur', prix: 370, parc: false },
+  { id: 'm-smallhd', nom: 'Moniteur SmallHD Indie 7', cat: 'Moniteur', prix: 40, parc: true },
+  { id: 'm-sdi10', nom: 'Câble SDI 12G 10m', cat: 'Câbles', prix: 2, parc: true },
+  { id: 'm-xlr10', nom: 'Câble XLR 10m', cat: 'Câbles', prix: 2.5, parc: true },
+  { id: 'm-touret-sdi', nom: 'Touret SDI 50m', cat: 'Câbles', prix: 18, parc: false },
+  { id: 'm-touret-rj45', nom: 'Touret RJ45 prise ronde 50m', cat: 'Câbles', prix: 23, parc: false },
+];
+
+const DEFAULT_FRAIS = [
+  { id: 'f-hotel', nom: 'Hôtel / nuit', cat: 'Hébergement', prix: 95 },
+  { id: 'f-repas', nom: 'Repas / personne', cat: 'Restauration', prix: 25 },
+  { id: 'f-train', nom: 'Aller-retour train', cat: 'Transport', prix: 120 },
+  { id: 'f-essence', nom: 'Essence + péages (taux kilométrique)', cat: 'Transport', prix: 0.356 },
+  { id: 'f-utilitaire', nom: 'Location utilitaire / jour', cat: 'Transport', prix: 90 },
+  { id: 'f-lieu', nom: 'Location de lieu / jour', cat: 'Lieu', prix: 800 },
+  { id: 'f-assur', nom: 'Assurance + frais bancaires (2 %)', cat: 'Divers', prix: 0 },
+];
+
+const DEFAULT_STRUCTURE = { charges: 13000, jours: 100, marge: 15 };
+
+const DEFAULT_TEMPLATES = [];
+
+// ===== ÉTAT GLOBAL =====
+
+const STORAGE_KEY_PARAMS = 'calc-mcp-params-v2';
+const STORAGE_KEY_DEVIS_LIST = 'calc-mcp-devis-list-v2';
+const STORAGE_KEY_CURRENT = 'calc-mcp-current-devis-v2';
+const STORAGE_KEY_THEME = 'calc-mcp-theme';
+const MAX_DEVIS = 50;
+
+function loadParams() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_PARAMS);
+    if (raw) {
+      const p = JSON.parse(raw);
+      if (!p.templates) p.templates = [];
+      return p;
+    }
+  } catch (e) {}
+  return {
+    structure: { ...DEFAULT_STRUCTURE },
+    postes: [...DEFAULT_POSTES],
+    materiel: [...DEFAULT_MATERIEL],
+    frais: [...DEFAULT_FRAIS],
+    templates: [...DEFAULT_TEMPLATES],
+  };
+}
+function saveParams() {
+  try { localStorage.setItem(STORAGE_KEY_PARAMS, JSON.stringify(params)); } catch (e) {}
+}
+
+function loadDevisList() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_DEVIS_LIST);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {}
+  return [];
+}
+function saveDevisList() {
+  try { localStorage.setItem(STORAGE_KEY_DEVIS_LIST, JSON.stringify(devisList)); } catch (e) {}
+}
+function loadCurrentId() {
+  try { return localStorage.getItem(STORAGE_KEY_CURRENT); } catch (e) { return null; }
+}
+function saveCurrentId(id) {
+  try {
+    if (id) localStorage.setItem(STORAGE_KEY_CURRENT, id);
+    else localStorage.removeItem(STORAGE_KEY_CURRENT);
+  } catch (e) {}
+}
+
+function emptyDevis() {
+  return {
+    id: uid('d'),
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    projet: { nom: '', client: '', date: '', ref: '' },
+    preprod: [],
+    prod: [],
+    postprod: [],
+    materiel: [],
+    frais: [],
+    margePct: null,       // null = utiliser la valeur de params.structure.marge
+    prixFinal: null,
+  };
+}
+
+function uid(prefix = 'l') {
+  return prefix + '-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+
+let params = loadParams();
+let devisList = loadDevisList();
+let devis = null;
+
+// Initialiser le devis courant
+function initCurrentDevis() {
+  const currentId = loadCurrentId();
+  if (currentId) {
+    const found = devisList.find(d => d.id === currentId);
+    if (found) {
+      devis = found;
+      return;
+    }
+  }
+  // Sinon créer un nouveau devis vide
+  devis = emptyDevis();
+  devisList.unshift(devis);
+  saveDevisList();
+  saveCurrentId(devis.id);
+}
+
+function saveDevis() {
+  if (!devis) return;
+  devis.updatedAt = Date.now();
+  // Mettre à jour la liste : remplacer ou ajouter
+  const idx = devisList.findIndex(d => d.id === devis.id);
+  if (idx >= 0) devisList[idx] = devis;
+  else devisList.unshift(devis);
+  // Limiter la taille
+  if (devisList.length > MAX_DEVIS) devisList.length = MAX_DEVIS;
+  saveDevisList();
+  saveCurrentId(devis.id);
+}
+
+function switchToDevis(id) {
+  const found = devisList.find(d => d.id === id);
+  if (!found) return false;
+  devis = found;
+  saveCurrentId(devis.id);
+  renderDevis();
+  return true;
+}
+
+function createNewDevis() {
+  devis = emptyDevis();
+  devisList.unshift(devis);
+  if (devisList.length > MAX_DEVIS) devisList.length = MAX_DEVIS;
+  saveDevisList();
+  saveCurrentId(devis.id);
+  renderDevis();
+}
+
+function duplicateDevis(sourceId) {
+  const source = sourceId ? devisList.find(d => d.id === sourceId) : devis;
+  if (!source) return null;
+  const copy = JSON.parse(JSON.stringify(source));
+  copy.id = uid('d');
+  copy.createdAt = Date.now();
+  copy.updatedAt = Date.now();
+  copy.projet = {
+    nom: source.projet.nom ? source.projet.nom + ' (copie)' : 'Copie de devis',
+    client: source.projet.client || '',
+    date: '',
+    ref: '',
+  };
+  copy.prixFinal = null;
+  devisList.unshift(copy);
+  if (devisList.length > MAX_DEVIS) devisList.length = MAX_DEVIS;
+  saveDevisList();
+  return copy;
+}
+
+function deleteDevis(id) {
+  const idx = devisList.findIndex(d => d.id === id);
+  if (idx < 0) return;
+  devisList.splice(idx, 1);
+  saveDevisList();
+  if (devis && devis.id === id) {
+    // Le devis supprimé est le courant → on bascule
+    if (devisList.length > 0) {
+      devis = devisList[0];
+      saveCurrentId(devis.id);
+    } else {
+      createNewDevis();
+    }
+    renderDevis();
+  }
+}
+
+// ===== UTILITAIRES =====
+
+const fmtEur = (n) => {
+  if (!isFinite(n)) return '0 €';
+  return new Intl.NumberFormat('fr-FR', { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 }).format(n);
+};
+const fmtNum = (n, d = 1) => {
+  if (!isFinite(n)) return '0';
+  return new Intl.NumberFormat('fr-FR', { maximumFractionDigits: d }).format(n);
+};
+const parseNum = (s) => {
+  if (typeof s === 'number') return s;
+  if (!s) return 0;
+  const cleaned = String(s).replace(/[^\d,.\-]/g, '').replace(',', '.');
+  const n = parseFloat(cleaned);
+  return isFinite(n) ? n : 0;
+};
+
+function escapeHtml(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function fmtDate(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  const dd = String(d.getDate()).padStart(2, '0');
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const yy = d.getFullYear();
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mi = String(d.getMinutes()).padStart(2, '0');
+  return `${dd}/${mm}/${yy} ${hh}:${mi}`;
+}
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(t._timeout);
+  t._timeout = setTimeout(() => t.classList.remove('show'), 2200);
+}
+
+function confirmModal(title, body) {
+  return new Promise((resolve) => {
+    const modal = document.getElementById('confirm-modal');
+    document.getElementById('modal-title').textContent = title;
+    document.getElementById('modal-body').textContent = body;
+    const cancel = document.getElementById('modal-cancel');
+    const confirm = document.getElementById('modal-confirm');
+    const onCancel = () => { cleanup(); resolve(false); };
+    const onConfirm = () => { cleanup(); resolve(true); };
+    const cleanup = () => {
+      cancel.removeEventListener('click', onCancel);
+      confirm.removeEventListener('click', onConfirm);
+      modal.close();
+    };
+    cancel.addEventListener('click', onCancel);
+    confirm.addEventListener('click', onConfirm);
+    modal.showModal();
+  });
+}
+
+function promptModal(title, body, defaultValue = '') {
+  return new Promise((resolve) => {
+    const modal = document.getElementById('prompt-modal');
+    document.getElementById('prompt-title').textContent = title;
+    document.getElementById('prompt-body').textContent = body;
+    const input = document.getElementById('prompt-input');
+    input.value = defaultValue;
+    const cancel = document.getElementById('prompt-cancel');
+    const confirm = document.getElementById('prompt-confirm');
+    const onCancel = () => { cleanup(); resolve(null); };
+    const onConfirm = () => { cleanup(); resolve(input.value); };
+    const onKey = (e) => { if (e.key === 'Enter') onConfirm(); };
+    const cleanup = () => {
+      cancel.removeEventListener('click', onCancel);
+      confirm.removeEventListener('click', onConfirm);
+      input.removeEventListener('keydown', onKey);
+      modal.close();
+    };
+    cancel.addEventListener('click', onCancel);
+    confirm.addEventListener('click', onConfirm);
+    input.addEventListener('keydown', onKey);
+    modal.showModal();
+    setTimeout(() => input.focus(), 0);
+  });
+}
+
+// ===== CALCUL =====
+
+function getPosteRate(posteId, source) {
+  const p = params.postes.find(x => x.id === posteId);
+  if (!p) return 0;
+  if (source === 'interne' && p.interne != null) return p.interne;
+  if (source === 'externe' && p.externe != null) return p.externe;
+  return p.interne ?? p.externe ?? 0;
+}
+function getMaterielRate(matId) {
+  const m = params.materiel.find(x => x.id === matId);
+  return m ? m.prix : 0;
+}
+function lineTotalPoste(line) {
+  return getPosteRate(line.posteId, line.source) * (parseNum(line.jours) || 0);
+}
+function lineTotalMateriel(line) {
+  return getMaterielRate(line.matId) * (parseNum(line.jours) || 0);
+}
+function lineTotalFrais(line) {
+  return (parseNum(line.pu) || 0) * (parseNum(line.qte) || 0);
+}
+function totalSection(arr, fn) {
+  return arr.reduce((s, l) => s + fn(l), 0);
+}
+
+function joursProduction() {
+  let j = 0;
+  [...devis.preprod, ...devis.prod, ...devis.postprod].forEach(l => {
+    j += parseNum(l.jours) || 0;
+  });
+  return j;
+}
+
+function coutStructure() {
+  return params.structure.charges / Math.max(1, params.structure.jours);
+}
+function partStructure() {
+  return coutStructure() * joursProduction();
+}
+
+function effectiveMargePct() {
+  // Marge spécifique au devis ou marge par défaut
+  return (devis.margePct != null ? devis.margePct : params.structure.marge) / 100;
+}
+
+function calc() {
+  const tPreprod = totalSection(devis.preprod, lineTotalPoste);
+  const tProd = totalSection(devis.prod, lineTotalPoste);
+  const tPost = totalSection(devis.postprod, lineTotalPoste);
+  const tMat = totalSection(devis.materiel, lineTotalMateriel);
+  const tFrais = totalSection(devis.frais, lineTotalFrais);
+  const tStruct = partStructure();
+  const coutTotal = tPreprod + tProd + tPost + tMat + tFrais + tStruct;
+  const margePct = effectiveMargePct();
+  const marge = coutTotal * margePct;
+  const totalHT = coutTotal + marge;
+  const totalTTC = totalHT * 1.2;
+  return { tPreprod, tProd, tPost, tMat, tFrais, tStruct, coutTotal, marge, margePct, totalHT, totalTTC };
+}
+
+
+// ===== RENDU PRINCIPAL =====
+
+function renderDevis() {
+  // Champs projet
+  document.getElementById('proj-nom').value = devis.projet.nom || '';
+  document.getElementById('proj-client').value = devis.projet.client || '';
+  document.getElementById('proj-date').value = devis.projet.date || '';
+  document.getElementById('proj-ref').value = devis.projet.ref || '';
+
+  renderPosteSection('preprod');
+  renderPosteSection('prod');
+  renderPosteSection('postprod');
+  renderMaterielSection();
+  renderFraisSection();
+  renderRecap();
+  updateHeaderSubtitle();
+  updatePrintHeader();
+}
+
+function updateHeaderSubtitle() {
+  const sub = document.getElementById('header-subtitle');
+  const parts = [];
+  if (devis.projet.nom) parts.push(devis.projet.nom);
+  if (devis.projet.client) parts.push(devis.projet.client);
+  sub.textContent = parts.length ? parts.join(' · ') : 'Nouveau devis';
+}
+
+function updatePrintHeader() {
+  document.getElementById('print-projet-nom').textContent = devis.projet.nom || 'Devis sans nom';
+  const parts = [];
+  if (devis.projet.client) parts.push('Client : ' + devis.projet.client);
+  if (devis.projet.date) parts.push('Date : ' + devis.projet.date);
+  if (devis.projet.ref) parts.push('Réf. : ' + devis.projet.ref);
+  document.getElementById('print-projet-meta').textContent = parts.join(' · ');
+}
+
+function renderPosteSection(phase) {
+  const tbody = document.querySelector(`#tbl-${phase} tbody`);
+  const arr = devis[phase];
+  tbody.innerHTML = '';
+  if (arr.length === 0) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="6">Aucun poste — utilise la recherche ci-dessous</td></tr>';
+  } else {
+    arr.forEach((line, idx) => {
+      const poste = params.postes.find(p => p.id === line.posteId);
+      if (!poste) return;
+      const tr = document.createElement('tr');
+      if (line._flash) { tr.classList.add('flash'); delete line._flash; }
+      const rate = getPosteRate(line.posteId, line.source);
+      const total = rate * (parseNum(line.jours) || 0);
+      const optsSource = [];
+      if (poste.interne != null) optsSource.push(`<option value="interne" ${line.source === 'interne' ? 'selected' : ''}>Interne</option>`);
+      if (poste.externe != null) optsSource.push(`<option value="externe" ${line.source === 'externe' ? 'selected' : ''}>Externe</option>`);
+      tr.innerHTML = `
+        <td>${escapeHtml(poste.nom)}</td>
+        <td class="ctr">${optsSource.length > 1
+          ? `<select class="source-select" data-action="source" data-phase="${phase}" data-idx="${idx}">${optsSource.join('')}</select>`
+          : `<span class="badge ${line.source}">${line.source === 'interne' ? 'interne' : 'ext.'}</span>`}</td>
+        <td class="num">${fmtEur(rate)}</td>
+        <td class="num"><input type="text" class="num qty" value="${line.jours}" data-action="jours" data-phase="${phase}" data-idx="${idx}"></td>
+        <td class="num total">${fmtEur(total)}</td>
+        <td class="ctr"><button class="subtle icon-only" data-action="delete" data-phase="${phase}" data-idx="${idx}" title="Supprimer">✕</button></td>
+      `;
+      tbody.appendChild(tr);
+    });
+  }
+  const idMap = { preprod: 'st-preprod', prod: 'st-prod', postprod: 'st-postprod' };
+  document.getElementById(idMap[phase]).textContent = fmtEur(totalSection(arr, lineTotalPoste));
+}
+
+function renderMaterielSection() {
+  const tbody = document.querySelector('#tbl-materiel tbody');
+  tbody.innerHTML = '';
+  if (devis.materiel.length === 0) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="6">Aucun équipement</td></tr>';
+  } else {
+    devis.materiel.forEach((line, idx) => {
+      const mat = params.materiel.find(m => m.id === line.matId);
+      if (!mat) return;
+      const tr = document.createElement('tr');
+      if (line._flash) { tr.classList.add('flash'); delete line._flash; }
+      const rate = mat.prix;
+      const total = rate * (parseNum(line.jours) || 0);
+      // Source : si parc dispo, sélecteur ; sinon badge fixé
+      let sourceCell;
+      if (mat.parc) {
+        sourceCell = `<select class="source-select" data-action="mat-source" data-idx="${idx}">
+          <option value="parc" ${line.source === 'parc' ? 'selected' : ''}>Parc</option>
+          <option value="loue" ${line.source === 'loue' ? 'selected' : ''}>Loué</option>
+        </select>`;
+      } else {
+        sourceCell = `<span class="badge loue">loué</span>`;
+      }
+      tr.innerHTML = `
+        <td>${escapeHtml(mat.nom)}</td>
+        <td class="ctr">${sourceCell}</td>
+        <td class="num">${fmtEur(rate)}</td>
+        <td class="num"><input type="text" class="num qty" value="${line.jours}" data-action="mat-jours" data-idx="${idx}"></td>
+        <td class="num total">${fmtEur(total)}</td>
+        <td class="ctr"><button class="subtle icon-only" data-action="mat-delete" data-idx="${idx}" title="Supprimer">✕</button></td>
+      `;
+      tbody.appendChild(tr);
+    });
+  }
+  document.getElementById('st-materiel').textContent = fmtEur(totalSection(devis.materiel, lineTotalMateriel));
+}
+
+function renderFraisSection() {
+  const tbody = document.querySelector('#tbl-frais tbody');
+  tbody.innerHTML = '';
+  if (devis.frais.length === 0) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="6">Aucun frais</td></tr>';
+  } else {
+    devis.frais.forEach((line, idx) => {
+      const tr = document.createElement('tr');
+      if (line._flash) { tr.classList.add('flash'); delete line._flash; }
+      const total = lineTotalFrais(line);
+      tr.innerHTML = `
+        <td><input type="text" value="${escapeHtml(line.nom)}" data-action="frais-nom" data-idx="${idx}"></td>
+        <td class="ctr"><span class="badge libre">${escapeHtml(line.cat || 'libre')}</span></td>
+        <td class="num"><input type="text" class="num rate" value="${line.pu}" data-action="frais-pu" data-idx="${idx}"></td>
+        <td class="num"><input type="text" class="num qty" value="${line.qte}" data-action="frais-qte" data-idx="${idx}"></td>
+        <td class="num total">${fmtEur(total)}</td>
+        <td class="ctr"><button class="subtle icon-only" data-action="frais-delete" data-idx="${idx}" title="Supprimer">✕</button></td>
+      `;
+      tbody.appendChild(tr);
+    });
+  }
+  document.getElementById('st-frais').textContent = fmtEur(totalSection(devis.frais, lineTotalFrais));
+}
+
+function renderRecap() {
+  const c = calc();
+  document.getElementById('r-preprod').textContent = fmtEur(c.tPreprod);
+  document.getElementById('r-prod').textContent = fmtEur(c.tProd);
+  document.getElementById('r-postprod').textContent = fmtEur(c.tPost);
+  document.getElementById('r-materiel').textContent = fmtEur(c.tMat);
+  document.getElementById('r-frais').textContent = fmtEur(c.tFrais);
+  document.getElementById('r-structure').textContent = fmtEur(c.tStruct);
+  document.getElementById('r-jours-prod').textContent = fmtNum(joursProduction(), 1);
+  document.getElementById('r-cs-jour').textContent = fmtNum(coutStructure(), 0);
+  document.getElementById('r-cout-total').textContent = fmtEur(c.coutTotal);
+  document.getElementById('r-marge').textContent = fmtEur(c.marge);
+  document.getElementById('r-ht').textContent = fmtEur(c.totalHT);
+  document.getElementById('r-ttc').textContent = `Soit ${fmtEur(c.totalTTC)} TTC (TVA 20 %)`;
+
+  // Marge slider
+  const margePct = Math.round(c.margePct * 100);
+  document.getElementById('marge-pct-display').textContent = margePct;
+  document.getElementById('marge-slider').value = Math.min(margePct, 40);
+  document.getElementById('marge-number').value = margePct;
+
+  // Prix final
+  const prixFinal = devis.prixFinal != null ? devis.prixFinal : c.totalHT;
+  document.getElementById('prix-final').value = fmtNum(prixFinal, 0).replace(/\s/g, ' ');
+
+  const deltaEl = document.getElementById('prix-delta');
+  if (devis.prixFinal != null && Math.abs(devis.prixFinal - c.totalHT) > 0.5) {
+    const diff = devis.prixFinal - c.totalHT;
+    const sign = diff >= 0 ? '+' : '';
+    deltaEl.innerHTML = `<span style="color: ${diff >= 0 ? 'var(--success)' : 'var(--warning)'}">${sign}${fmtEur(diff)}</span> vs calcul théorique`;
+  } else {
+    deltaEl.innerHTML = '&nbsp;';
+  }
+
+  // Marge nette
+  const margeNette = prixFinal - c.coutTotal;
+  const pillEl = document.getElementById('marge-pill');
+  pillEl.classList.remove('bad', 'warn');
+  if (margeNette < 0) pillEl.classList.add('bad');
+  else if (margeNette < c.coutTotal * 0.05) pillEl.classList.add('warn');
+  document.getElementById('r-marge-nette').textContent = fmtEur(margeNette);
+
+  // Warnings
+  renderCompletionWarnings();
+}
+
+function renderCompletionWarnings() {
+  const warnings = [];
+  if (!devis.projet.nom) warnings.push("Pas de nom de projet renseigné");
+  if (!devis.projet.client) warnings.push("Pas de client renseigné");
+  if (devis.preprod.length === 0) warnings.push("Pas de pré-production — pense au temps de gestion de projet et au repérage");
+  if (devis.prod.length === 0 && devis.materiel.length > 0) warnings.push("Du matériel sans équipe pour le manipuler ?");
+  if (devis.prod.length > 0 && devis.postprod.length === 0) warnings.push("Pas de post-production — montage/livrables sont prévus ?");
+  if (devis.materiel.length === 0 && devis.prod.length > 0) warnings.push("De la production sans matériel ?");
+
+  const el = document.getElementById('completion-warnings');
+  const ul = document.getElementById('completion-list');
+  if (warnings.length === 0) {
+    el.classList.add('hidden');
+  } else {
+    el.classList.remove('hidden');
+    ul.innerHTML = warnings.map(w => `<li>${escapeHtml(w)}</li>`).join('');
+  }
+}
+
+// ===== ACTIONS =====
+
+function addPosteLine(phase, posteId) {
+  const poste = params.postes.find(p => p.id === posteId);
+  if (!poste) return;
+  const defaultSource = poste.interne != null ? 'interne' : 'externe';
+  devis[phase].push({ id: uid(), posteId, source: defaultSource, jours: 1, _flash: true });
+  saveDevis(); renderDevis();
+}
+function addMaterielLine(matId, opts) {
+  const mat = params.materiel.find(m => m.id === matId);
+  if (!mat) return;
+  const defaultSource = mat.parc ? 'parc' : 'loue';
+  const jours = opts && opts.jours ? opts.jours : 1;
+  devis.materiel.push({ id: uid(), matId, source: defaultSource, jours, _flash: true });
+  saveDevis(); renderDevis();
+}
+function addFraisLine(fraisId) {
+  const f = params.frais.find(x => x.id === fraisId);
+  if (!f) return;
+  devis.frais.push({ id: uid(), nom: f.nom, cat: f.cat, pu: f.prix, qte: 1, _flash: true });
+  saveDevis(); renderDevis();
+}
+function addFraisLibre() {
+  devis.frais.push({ id: uid(), nom: '', cat: 'libre', pu: 0, qte: 1, _flash: true });
+  saveDevis(); renderDevis();
+}
+
+// ===== EVENT DELEGATION TABLES =====
+
+document.addEventListener('input', (e) => {
+  const t = e.target;
+  const action = t.dataset.action;
+  if (action) {
+    const idx = parseInt(t.dataset.idx, 10);
+    const phase = t.dataset.phase;
+    if (action === 'jours') { devis[phase][idx].jours = t.value; saveDevis(); renderPosteSection(phase); renderRecap(); }
+    else if (action === 'mat-jours') { devis.materiel[idx].jours = t.value; saveDevis(); renderMaterielSection(); renderRecap(); }
+    else if (action === 'frais-pu') { devis.frais[idx].pu = t.value; saveDevis(); renderRecap(); refreshFraisRowTotal(idx); }
+    else if (action === 'frais-qte') { devis.frais[idx].qte = t.value; saveDevis(); renderRecap(); refreshFraisRowTotal(idx); }
+    else if (action === 'frais-nom') { devis.frais[idx].nom = t.value; saveDevis(); }
+    return;
+  }
+  // Catalog actions
+  const a = t.dataset.catAction;
+  if (a) {
+    const i = parseInt(t.dataset.idx, 10);
+    const v = t.value;
+    if (a === 'poste-nom') params.postes[i].nom = v;
+    else if (a === 'poste-interne') params.postes[i].interne = v === '' ? null : parseNum(v);
+    else if (a === 'poste-externe') params.postes[i].externe = v === '' ? null : parseNum(v);
+    else if (a === 'mat-nom') params.materiel[i].nom = v;
+    else if (a === 'mat-cat') params.materiel[i].cat = v;
+    else if (a === 'mat-prix') params.materiel[i].prix = parseNum(v);
+    else if (a === 'frais-nom') params.frais[i].nom = v;
+    else if (a === 'frais-cat') params.frais[i].cat = v;
+    else if (a === 'frais-prix') params.frais[i].prix = parseNum(v);
+    else if (a === 'tpl-nom') params.templates[i].nom = v;
+    else if (a === 'tpl-desc') params.templates[i].desc = v;
+    else return;
+    saveParams();
+    renderRecap();
+    return;
+  }
+});
+
+function refreshFraisRowTotal(idx) {
+  const tbody = document.querySelector('#tbl-frais tbody');
+  if (tbody.children[idx]) {
+    const totalCell = tbody.children[idx].querySelector('.total');
+    if (totalCell) totalCell.textContent = fmtEur(lineTotalFrais(devis.frais[idx]));
+  }
+  document.getElementById('st-frais').textContent = fmtEur(totalSection(devis.frais, lineTotalFrais));
+}
+
+document.addEventListener('change', (e) => {
+  const t = e.target;
+  const action = t.dataset.action;
+  if (action) {
+    const idx = parseInt(t.dataset.idx, 10);
+    const phase = t.dataset.phase;
+    if (action === 'source') { devis[phase][idx].source = t.value; saveDevis(); renderDevis(); }
+    else if (action === 'mat-source') { devis.materiel[idx].source = t.value; saveDevis(); renderDevis(); }
+    return;
+  }
+  const a = t.dataset.catAction;
+  if (a === 'poste-phase') {
+    const i = parseInt(t.dataset.idx, 10);
+    params.postes[i].phase = t.value;
+    saveParams();
+  } else if (a === 'mat-parc') {
+    const i = parseInt(t.dataset.idx, 10);
+    params.materiel[i].parc = t.checked;
+    saveParams();
+    renderDevis();
+  }
+});
+
+document.addEventListener('click', (e) => {
+  const t = e.target.closest('[data-action]');
+  if (t) {
+    const action = t.dataset.action;
+    const idx = parseInt(t.dataset.idx, 10);
+    const phase = t.dataset.phase;
+    if (action === 'delete') { devis[phase].splice(idx, 1); saveDevis(); renderDevis(); }
+    else if (action === 'mat-delete') { devis.materiel.splice(idx, 1); saveDevis(); renderDevis(); }
+    else if (action === 'frais-delete') { devis.frais.splice(idx, 1); saveDevis(); renderDevis(); }
+    return;
+  }
+  // Catalog deletes
+  const catBtn = e.target.closest('[data-cat-action]');
+  if (catBtn) {
+    const a = catBtn.dataset.catAction;
+    const i = parseInt(catBtn.dataset.idx, 10);
+    if (a === 'poste-delete') { params.postes.splice(i, 1); }
+    else if (a === 'mat-delete') { params.materiel.splice(i, 1); }
+    else if (a === 'frais-delete') { params.frais.splice(i, 1); }
+    else if (a === 'tpl-delete') { params.templates.splice(i, 1); }
+    else if (a === 'tpl-load') { return applyTemplate(params.templates[i]); }
+    else return;
+    saveParams();
+    renderParams();
+    renderDevis();
+  }
+  // Clear section buttons
+  const clearBtn = e.target.closest('[data-clear]');
+  if (clearBtn) {
+    const section = clearBtn.dataset.clear;
+    handleClearSection(section);
+  }
+});
+
+async function handleClearSection(section) {
+  const labels = { preprod: 'Pré-production', prod: 'Production', postprod: 'Post-production', materiel: 'Matériel', frais: 'Frais annexes' };
+  const arr = devis[section];
+  if (!arr || arr.length === 0) return;
+  const ok = await confirmModal('Vider la section', `Supprimer toutes les lignes de ${labels[section]} ?`);
+  if (!ok) return;
+  devis[section] = [];
+  saveDevis(); renderDevis();
+  toast('Section vidée');
+}
+
+// ===== CHAMPS PROJET =====
+
+['proj-nom', 'proj-client', 'proj-date', 'proj-ref'].forEach(id => {
+  document.getElementById(id).addEventListener('input', (e) => {
+    const key = id.replace('proj-', '');
+    devis.projet[key] = e.target.value;
+    saveDevis();
+    updateHeaderSubtitle();
+    updatePrintHeader();
+    renderCompletionWarnings();
+  });
+});
+
+// ===== PRIX FINAL =====
+
+document.getElementById('prix-final').addEventListener('change', (e) => {
+  const v = parseNum(e.target.value);
+  const c = calc();
+  if (Math.abs(v - c.totalHT) < 0.5) devis.prixFinal = null;
+  else devis.prixFinal = v;
+  saveDevis(); renderRecap();
+});
+document.getElementById('reset-prix').addEventListener('click', () => {
+  devis.prixFinal = null;
+  saveDevis(); renderRecap();
+});
+
+// ===== SLIDER DE MARGE =====
+
+function setMargePct(pct) {
+  pct = Math.max(0, Math.min(100, Math.round(pct)));
+  devis.margePct = pct;
+  saveDevis();
+  renderRecap();
+}
+document.getElementById('marge-slider').addEventListener('input', (e) => setMargePct(parseNum(e.target.value)));
+document.getElementById('marge-number').addEventListener('input', (e) => setMargePct(parseNum(e.target.value)));
+
+// ===== SEARCHABLE SELECTS =====
+
+function setupSearchableSelects() {
+  document.querySelectorAll('.searchable-select').forEach(ss => {
+    const target = ss.dataset.target;
+    const input = ss.querySelector('.ss-input');
+    const dropdown = ss.querySelector('.ss-dropdown');
+
+    input.addEventListener('focus', () => {
+      ss.classList.add('open');
+      renderDropdown(ss, target, input.value);
+    });
+    input.addEventListener('input', () => {
+      ss.classList.add('open');
+      renderDropdown(ss, target, input.value);
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        ss.classList.remove('open');
+        input.blur();
+      } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        moveHighlight(ss, e.key === 'ArrowDown' ? 1 : -1);
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        const hl = ss.querySelector('.ss-option.highlighted');
+        if (hl) hl.click();
+      }
+    });
+
+    document.addEventListener('click', (e) => {
+      if (!ss.contains(e.target)) ss.classList.remove('open');
+    });
+  });
+}
+
+function moveHighlight(ss, dir) {
+  const opts = [...ss.querySelectorAll('.ss-option')];
+  if (opts.length === 0) return;
+  let curIdx = opts.findIndex(o => o.classList.contains('highlighted'));
+  curIdx = curIdx + dir;
+  if (curIdx < 0) curIdx = opts.length - 1;
+  if (curIdx >= opts.length) curIdx = 0;
+  opts.forEach(o => o.classList.remove('highlighted'));
+  opts[curIdx].classList.add('highlighted');
+  opts[curIdx].scrollIntoView({ block: 'nearest' });
+}
+
+function renderDropdown(ss, target, query) {
+  const dd = ss.querySelector('.ss-dropdown');
+  const q = (query || '').trim().toLowerCase();
+  let items = [];
+
+  if (target === 'preprod' || target === 'prod' || target === 'postprod') {
+    items = params.postes.filter(p => p.phase === target);
+    if (q) items = items.filter(p => p.nom.toLowerCase().includes(q));
+    if (items.length === 0) {
+      dd.innerHTML = '<div class="ss-no-match">Aucun poste trouvé</div>';
+      return;
+    }
+    dd.innerHTML = items.map(p =>
+      `<div class="ss-option" data-add-poste="${target}" data-id="${p.id}">${escapeHtml(p.nom)}</div>`).join('');
+  } else if (target === 'materiel') {
+    items = params.materiel;
+    if (q) items = items.filter(m => m.nom.toLowerCase().includes(q) || m.cat.toLowerCase().includes(q));
+    if (items.length === 0) {
+      dd.innerHTML = '<div class="ss-no-match">Aucun équipement trouvé</div>';
+      return;
+    }
+    const byCat = {};
+    items.forEach(m => { (byCat[m.cat] = byCat[m.cat] || []).push(m); });
+    dd.innerHTML = Object.keys(byCat).map(cat => `
+      <div class="ss-group-label">${escapeHtml(cat)}</div>
+      ${byCat[cat].map(m => `<div class="ss-option" data-add-mat="1" data-id="${m.id}">
+        ${escapeHtml(m.nom)} <span style="color: var(--text-dim); font-variant-numeric: tabular-nums; float: right;">${fmtEur(m.prix)}/j</span>
+      </div>`).join('')}
+    `).join('');
+  } else if (target === 'frais') {
+    items = params.frais;
+    if (q) items = items.filter(f => f.nom.toLowerCase().includes(q) || (f.cat || '').toLowerCase().includes(q));
+    if (items.length === 0) {
+      dd.innerHTML = '<div class="ss-no-match">Aucun frais trouvé</div>';
+      return;
+    }
+    dd.innerHTML = items.map(f =>
+      `<div class="ss-option" data-add-frais="1" data-id="${f.id}">${escapeHtml(f.nom)} <span style="color: var(--text-dim); font-variant-numeric: tabular-nums; float: right;">${fmtEur(f.prix)}</span></div>`).join('');
+  }
+}
+
+document.addEventListener('click', (e) => {
+  const optPoste = e.target.closest('[data-add-poste]');
+  if (optPoste) {
+    const phase = optPoste.dataset.addPoste;
+    addPosteLine(phase, optPoste.dataset.id);
+    closeSelectAndClear(optPoste);
+    return;
+  }
+  const optMat = e.target.closest('[data-add-mat]');
+  if (optMat) {
+    addMaterielLine(optMat.dataset.id);
+    closeSelectAndClear(optMat);
+    return;
+  }
+  const optFrais = e.target.closest('[data-add-frais]');
+  if (optFrais) {
+    addFraisLine(optFrais.dataset.id);
+    closeSelectAndClear(optFrais);
+    return;
+  }
+});
+
+function closeSelectAndClear(optEl) {
+  const ss = optEl.closest('.searchable-select');
+  if (ss) {
+    ss.classList.remove('open');
+    const input = ss.querySelector('.ss-input');
+    if (input) { input.value = ''; input.blur(); }
+  }
+}
+
+document.getElementById('add-frais-libre-btn').addEventListener('click', addFraisLibre);
+
+// ===== NAVIGATION VUES =====
+
+function showView(name) {
+  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+  document.getElementById('view-' + name).classList.add('active');
+  document.getElementById('btn-view-devis').classList.toggle('primary', name === 'devis');
+  document.getElementById('btn-view-params').classList.toggle('primary', name === 'params');
+  if (name === 'params') renderParams();
+}
+document.getElementById('btn-view-devis').addEventListener('click', () => showView('devis'));
+document.getElementById('btn-view-params').addEventListener('click', () => showView('params'));
+
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c => c.style.display = 'none');
+    tab.classList.add('active');
+    document.getElementById('tab-' + tab.dataset.tab).style.display = 'block';
+  });
+});
+
+// ===== RENDU PARAMÈTRES =====
+
+function renderParams() {
+  document.getElementById('p-charges').value = params.structure.charges;
+  document.getElementById('p-jours').value = params.structure.jours;
+  document.getElementById('p-marge').value = params.structure.marge;
+  updateStructureKpis();
+
+  const tbodyP = document.getElementById('catalog-postes');
+  tbodyP.innerHTML = params.postes.map((p, i) => `
+    <tr>
+      <td><input type="text" value="${escapeHtml(p.nom)}" data-cat-action="poste-nom" data-idx="${i}"></td>
+      <td><select data-cat-action="poste-phase" data-idx="${i}">
+        <option value="preprod" ${p.phase === 'preprod' ? 'selected' : ''}>Pré-production</option>
+        <option value="prod" ${p.phase === 'prod' ? 'selected' : ''}>Production</option>
+        <option value="postprod" ${p.phase === 'postprod' ? 'selected' : ''}>Post-production</option>
+      </select></td>
+      <td class="num"><input type="text" class="num rate" value="${p.interne ?? ''}" placeholder="—" data-cat-action="poste-interne" data-idx="${i}"></td>
+      <td class="num"><input type="text" class="num rate" value="${p.externe ?? ''}" placeholder="—" data-cat-action="poste-externe" data-idx="${i}"></td>
+      <td class="ctr"><button class="subtle icon-only" data-cat-action="poste-delete" data-idx="${i}">✕</button></td>
+    </tr>`).join('');
+
+  const tbodyM = document.getElementById('catalog-materiel');
+  tbodyM.innerHTML = params.materiel.map((m, i) => `
+    <tr>
+      <td><input type="text" value="${escapeHtml(m.nom)}" data-cat-action="mat-nom" data-idx="${i}"></td>
+      <td><input type="text" value="${escapeHtml(m.cat)}" data-cat-action="mat-cat" data-idx="${i}"></td>
+      <td class="num"><input type="text" class="num rate" value="${m.prix}" data-cat-action="mat-prix" data-idx="${i}"></td>
+      <td class="ctr"><input type="checkbox" ${m.parc ? 'checked' : ''} data-cat-action="mat-parc" data-idx="${i}"></td>
+      <td class="ctr"><button class="subtle icon-only" data-cat-action="mat-delete" data-idx="${i}">✕</button></td>
+    </tr>`).join('');
+
+  const tbodyF = document.getElementById('catalog-frais');
+  tbodyF.innerHTML = params.frais.map((f, i) => `
+    <tr>
+      <td><input type="text" value="${escapeHtml(f.nom)}" data-cat-action="frais-nom" data-idx="${i}"></td>
+      <td><input type="text" value="${escapeHtml(f.cat || '')}" data-cat-action="frais-cat" data-idx="${i}"></td>
+      <td class="num"><input type="text" class="num rate" value="${f.prix}" data-cat-action="frais-prix" data-idx="${i}"></td>
+      <td class="ctr"><button class="subtle icon-only" data-cat-action="frais-delete" data-idx="${i}">✕</button></td>
+    </tr>`).join('');
+
+  const tbodyT = document.getElementById('catalog-templates');
+  if (params.templates.length === 0) {
+    tbodyT.innerHTML = '<tr><td colspan="4" style="text-align:center; padding: 20px; color: var(--text-dim); font-style: italic;">Aucun template — crée-en un depuis un devis en cours</td></tr>';
+  } else {
+    tbodyT.innerHTML = params.templates.map((tpl, i) => {
+      const nbLignes = (tpl.preprod?.length || 0) + (tpl.prod?.length || 0) + (tpl.postprod?.length || 0) + (tpl.materiel?.length || 0) + (tpl.frais?.length || 0);
+      return `<tr>
+        <td><input type="text" value="${escapeHtml(tpl.nom || '')}" data-cat-action="tpl-nom" data-idx="${i}"></td>
+        <td><input type="text" value="${escapeHtml(tpl.desc || '')}" data-cat-action="tpl-desc" data-idx="${i}" placeholder="Brève description"></td>
+        <td>${nbLignes} ligne${nbLignes > 1 ? 's' : ''}</td>
+        <td class="ctr">
+          <button class="subtle icon-only" data-cat-action="tpl-load" data-idx="${i}" title="Appliquer">↩</button>
+          <button class="subtle icon-only" data-cat-action="tpl-delete" data-idx="${i}" title="Supprimer">✕</button>
+        </td>
+      </tr>`;
+    }).join('');
+  }
+}
+
+function updateStructureKpis() {
+  const cs = params.structure.charges / Math.max(1, params.structure.jours);
+  document.getElementById('kpi-cs').textContent = fmtEur(cs);
+  document.getElementById('kpi-ca-min').textContent = fmtEur(params.structure.charges);
+}
+
+['p-charges', 'p-jours', 'p-marge'].forEach(id => {
+  document.getElementById(id).addEventListener('input', (e) => {
+    const v = parseNum(e.target.value);
+    if (id === 'p-charges') params.structure.charges = v;
+    if (id === 'p-jours') params.structure.jours = Math.max(1, v);
+    if (id === 'p-marge') params.structure.marge = v;
+    saveParams();
+    updateStructureKpis();
+    renderRecap();
+  });
+});
+
+document.getElementById('add-poste-catalog').addEventListener('click', () => {
+  params.postes.push({ id: uid('p'), nom: 'Nouveau poste', phase: 'prod', interne: 400, externe: 460 });
+  saveParams(); renderParams();
+});
+document.getElementById('add-materiel-catalog').addEventListener('click', () => {
+  params.materiel.push({ id: uid('m'), nom: 'Nouvel équipement', cat: 'Autre', prix: 50, parc: true });
+  saveParams(); renderParams();
+});
+document.getElementById('add-frais-catalog').addEventListener('click', () => {
+  params.frais.push({ id: uid('f'), nom: 'Nouveau frais', cat: 'Divers', prix: 50 });
+  saveParams(); renderParams();
+});
+
+// ===== TEMPLATES =====
+
+document.getElementById('add-template-catalog').addEventListener('click', async () => {
+  const nom = await promptModal('Créer un template', 'Nomme ce template (ex: "Captation 1 cam 1 jour")', devis.projet.nom || '');
+  if (!nom) return;
+  const tpl = {
+    id: uid('t'),
+    nom,
+    desc: '',
+    preprod: JSON.parse(JSON.stringify(devis.preprod)),
+    prod: JSON.parse(JSON.stringify(devis.prod)),
+    postprod: JSON.parse(JSON.stringify(devis.postprod)),
+    materiel: JSON.parse(JSON.stringify(devis.materiel)),
+    frais: JSON.parse(JSON.stringify(devis.frais)),
+  };
+  // Nettoyer les marqueurs _flash
+  ['preprod','prod','postprod','materiel','frais'].forEach(k => tpl[k].forEach(l => delete l._flash));
+  params.templates.push(tpl);
+  saveParams();
+  renderParams();
+  toast('Template créé');
+});
+
+async function applyTemplate(tpl) {
+  if (!tpl) return;
+  const hasContent = devis.preprod.length || devis.prod.length || devis.postprod.length || devis.materiel.length || devis.frais.length;
+  if (hasContent) {
+    const ok = await confirmModal('Appliquer le template', `Remplacer le contenu actuel du devis par "${tpl.nom}" ?`);
+    if (!ok) return;
+  }
+  devis.preprod = JSON.parse(JSON.stringify(tpl.preprod || []));
+  devis.prod = JSON.parse(JSON.stringify(tpl.prod || []));
+  devis.postprod = JSON.parse(JSON.stringify(tpl.postprod || []));
+  devis.materiel = JSON.parse(JSON.stringify(tpl.materiel || []));
+  devis.frais = JSON.parse(JSON.stringify(tpl.frais || []));
+  ['preprod','prod','postprod','materiel','frais'].forEach(k => devis[k].forEach(l => l._flash = true));
+  saveDevis(); renderDevis();
+  document.getElementById('templates-modal').close();
+  showView('devis');
+  toast(`Template "${tpl.nom}" appliqué`);
+}
+
+// Templates modal
+document.getElementById('btn-templates').addEventListener('click', () => {
+  const grid = document.getElementById('templates-grid');
+  if (params.templates.length === 0) {
+    grid.innerHTML = '<p style="grid-column: 1/-1; text-align: center; color: var(--text-muted); padding: 20px;">Aucun template — crée-en depuis un devis (Paramètres > Templates).</p>';
+  } else {
+    grid.innerHTML = params.templates.map((tpl, i) => `
+      <div class="template-card" data-tpl-idx="${i}">
+        <h4>${escapeHtml(tpl.nom || 'Template sans nom')}</h4>
+        <p>${escapeHtml(tpl.desc || '')}</p>
+      </div>
+    `).join('');
+  }
+  document.getElementById('templates-modal').showModal();
+});
+document.getElementById('templates-close').addEventListener('click', () => document.getElementById('templates-modal').close());
+document.getElementById('templates-grid').addEventListener('click', (e) => {
+  const card = e.target.closest('[data-tpl-idx]');
+  if (card) applyTemplate(params.templates[parseInt(card.dataset.tplIdx, 10)]);
+});
+
+// ===== DEVIS LIST MODAL =====
+
+document.getElementById('btn-devis-list').addEventListener('click', () => {
+  renderDevisListModal();
+  document.getElementById('devis-list-modal').showModal();
+});
+document.getElementById('devis-list-close').addEventListener('click', () => document.getElementById('devis-list-modal').close());
+document.getElementById('devis-list-search').addEventListener('input', () => renderDevisListModal());
+
+function renderDevisListModal() {
+  const q = (document.getElementById('devis-list-search').value || '').trim().toLowerCase();
+  const ul = document.getElementById('devis-list-ul');
+  let list = [...devisList].sort((a, b) => b.updatedAt - a.updatedAt);
+  if (q) {
+    list = list.filter(d =>
+      (d.projet.nom || '').toLowerCase().includes(q) ||
+      (d.projet.client || '').toLowerCase().includes(q));
+  }
+  if (list.length === 0) {
+    ul.innerHTML = '<li style="grid-template-columns: 1fr; text-align: center; color: var(--text-dim); font-style: italic; cursor: default;">Aucun devis</li>';
+  } else {
+    ul.innerHTML = list.map(d => {
+      const isCurrent = devis && d.id === devis.id;
+      // Calculer le total pour ce devis
+      const oldDevis = devis;
+      devis = d;
+      const c = calc();
+      const total = devis.prixFinal != null ? devis.prixFinal : c.totalHT;
+      devis = oldDevis;
+      const nom = d.projet.nom || '';
+      const client = d.projet.client || '';
+      const sub = client ? client : '';
+      return `<li class="${isCurrent ? 'current' : ''}" data-devis-id="${d.id}">
+        <div class="di-main">
+          <div class="di-name ${nom ? '' : 'empty'}">${nom ? escapeHtml(nom) : 'Sans nom'}</div>
+          <div class="di-meta">${escapeHtml(sub)}${sub ? ' · ' : ''}créé ${fmtDate(d.createdAt)}${isCurrent ? ' · <strong>actuel</strong>' : ''}</div>
+        </div>
+        <div class="di-total">${fmtEur(total)}</div>
+        <div class="di-actions">
+          <button data-devis-action="open" data-id="${d.id}" title="Ouvrir">Ouvrir</button>
+          <button data-devis-action="duplicate" data-id="${d.id}" title="Dupliquer" class="subtle">⎘</button>
+          <button data-devis-action="rename" data-id="${d.id}" title="Renommer" class="subtle">✎</button>
+          <button data-devis-action="delete" data-id="${d.id}" title="Supprimer" class="subtle">✕</button>
+        </div>
+      </li>`;
+    }).join('');
+  }
+  document.getElementById('devis-list-info').textContent = `${devisList.length} devis sauvegardés (max ${MAX_DEVIS}).`;
+}
+
+document.getElementById('devis-list-ul').addEventListener('click', async (e) => {
+  const btn = e.target.closest('[data-devis-action]');
+  if (!btn) {
+    const li = e.target.closest('[data-devis-id]');
+    if (li) {
+      switchToDevis(li.dataset.devisId);
+      document.getElementById('devis-list-modal').close();
+    }
+    return;
+  }
+  const action = btn.dataset.devisAction;
+  const id = btn.dataset.id;
+  e.stopPropagation();
+  if (action === 'open') {
+    switchToDevis(id);
+    document.getElementById('devis-list-modal').close();
+  } else if (action === 'duplicate') {
+    const copy = duplicateDevis(id);
+    if (copy) {
+      switchToDevis(copy.id);
+      document.getElementById('devis-list-modal').close();
+      toast('Devis dupliqué');
+    }
+  } else if (action === 'rename') {
+    const target = devisList.find(d => d.id === id);
+    if (!target) return;
+    const newName = await promptModal('Renommer le devis', 'Nouveau nom du projet', target.projet.nom || '');
+    if (newName === null) return;
+    target.projet.nom = newName;
+    target.updatedAt = Date.now();
+    saveDevisList();
+    if (devis && devis.id === id) {
+      renderDevis();
+    }
+    renderDevisListModal();
+  } else if (action === 'delete') {
+    const target = devisList.find(d => d.id === id);
+    const label = target?.projet.nom || 'sans nom';
+    const ok = await confirmModal('Supprimer le devis', `Supprimer définitivement le devis "${label}" ?`);
+    if (!ok) return;
+    deleteDevis(id);
+    renderDevisListModal();
+    toast('Devis supprimé');
+  }
+});
+
+// ===== MULTI-MATÉRIEL MODAL =====
+
+let multiMatSelection = {};   // id -> jours
+
+document.getElementById('btn-add-multi-mat').addEventListener('click', () => {
+  multiMatSelection = {};
+  renderMultiMatList('');
+  document.getElementById('multi-mat-search').value = '';
+  document.getElementById('multi-mat-modal').showModal();
+});
+document.getElementById('multi-mat-cancel').addEventListener('click', () => document.getElementById('multi-mat-modal').close());
+document.getElementById('multi-mat-search').addEventListener('input', (e) => renderMultiMatList(e.target.value));
+
+function renderMultiMatList(query) {
+  const q = (query || '').trim().toLowerCase();
+  const list = document.getElementById('multi-mat-list');
+  let items = params.materiel;
+  if (q) items = items.filter(m => m.nom.toLowerCase().includes(q) || m.cat.toLowerCase().includes(q));
+  if (items.length === 0) {
+    list.innerHTML = '<div class="ss-no-match">Aucun équipement trouvé</div>';
+    return;
+  }
+  const byCat = {};
+  items.forEach(m => { (byCat[m.cat] = byCat[m.cat] || []).push(m); });
+  let html = '';
+  for (const cat of Object.keys(byCat)) {
+    html += `<div class="multi-mat-cat-label">${escapeHtml(cat)}</div>`;
+    for (const m of byCat[cat]) {
+      const checked = !!multiMatSelection[m.id];
+      html += `<label class="multi-mat-item ${checked ? 'checked' : ''}">
+        <input type="checkbox" data-mm-id="${m.id}" ${checked ? 'checked' : ''}>
+        <span class="mat-name">${escapeHtml(m.nom)}</span>
+        <span class="mat-source-chip badge ${m.parc ? 'parc' : 'loue'}">${m.parc ? 'parc' : 'loué'}</span>
+        <span class="mat-price">${fmtEur(m.prix)}/j</span>
+      </label>`;
+    }
+  }
+  list.innerHTML = html;
+  updateMultiMatSummary();
+}
+
+function updateMultiMatSummary() {
+  const ids = Object.keys(multiMatSelection);
+  document.getElementById('multi-mat-count').textContent = ids.length;
+  const total = ids.reduce((s, id) => {
+    const m = params.materiel.find(x => x.id === id);
+    return s + (m ? m.prix : 0);
+  }, 0);
+  document.getElementById('multi-mat-total').textContent = fmtEur(total);
+}
+
+document.getElementById('multi-mat-list').addEventListener('change', (e) => {
+  const cb = e.target.closest('[data-mm-id]');
+  if (!cb) return;
+  const id = cb.dataset.mmId;
+  if (cb.checked) multiMatSelection[id] = 1;
+  else delete multiMatSelection[id];
+  cb.closest('.multi-mat-item').classList.toggle('checked', cb.checked);
+  updateMultiMatSummary();
+});
+
+document.getElementById('multi-mat-confirm').addEventListener('click', () => {
+  const ids = Object.keys(multiMatSelection);
+  if (ids.length === 0) {
+    document.getElementById('multi-mat-modal').close();
+    return;
+  }
+  ids.forEach(id => addMaterielLine(id, { jours: multiMatSelection[id] }));
+  document.getElementById('multi-mat-modal').close();
+  toast(`${ids.length} équipement(s) ajouté(s)`);
+});
+
+// ===== ACTIONS HEADER (nouveau, dupliquer, imprimer, etc) =====
+
+document.getElementById('btn-new').addEventListener('click', async () => {
+  const hasContent = devis.preprod.length || devis.prod.length || devis.postprod.length || devis.materiel.length || devis.frais.length;
+  if (hasContent && !devis.projet.nom) {
+    const ok = await confirmModal('Nouveau devis', 'Le devis actuel n\'a pas de nom. Créer un nouveau devis (l\'actuel sera conservé dans la liste) ?');
+    if (!ok) return;
+  }
+  createNewDevis();
+  toast('Nouveau devis');
+});
+
+document.getElementById('btn-duplicate').addEventListener('click', () => {
+  const copy = duplicateDevis();
+  if (copy) {
+    switchToDevis(copy.id);
+    toast('Devis dupliqué');
+  }
+});
+
+document.getElementById('btn-print').addEventListener('click', () => window.print());
+
+// ===== EXPORT / IMPORT =====
+
+function exportDevis() {
+  const c = calc();
+  const out = {
+    meta: { type: 'devis', version: 2, exported_at: new Date().toISOString() },
+    projet: devis.projet,
+    detail: {
+      preprod: devis.preprod.map(buildPosteDetail),
+      prod: devis.prod.map(buildPosteDetail),
+      postprod: devis.postprod.map(buildPosteDetail),
+      materiel: devis.materiel.map(l => {
+        const m = params.materiel.find(x => x.id === l.matId);
+        return { nom: m?.nom, source: l.source, jours: parseNum(l.jours), pu: m?.prix, total: lineTotalMateriel(l) };
+      }),
+      frais: devis.frais.map(l => ({ nom: l.nom, cat: l.cat, pu: parseNum(l.pu), qte: parseNum(l.qte), total: lineTotalFrais(l) })),
+    },
+    totaux: {
+      preprod: c.tPreprod, prod: c.tProd, postprod: c.tPost,
+      materiel: c.tMat, frais: c.tFrais,
+      structure: c.tStruct, joursProduction: joursProduction(),
+      coutTotal: c.coutTotal, marge: c.marge, margePct: c.margePct * 100,
+      totalHT: c.totalHT, totalTTC: c.totalTTC,
+      prixFinal: devis.prixFinal != null ? devis.prixFinal : c.totalHT,
+      margeNette: (devis.prixFinal != null ? devis.prixFinal : c.totalHT) - c.coutTotal,
+    },
+  };
+  download(JSON.stringify(out, null, 2), `devis-${slug(devis.projet.nom || 'sans-nom')}-${ymd()}.json`);
+}
+function buildPosteDetail(line) {
+  const p = params.postes.find(x => x.id === line.posteId);
+  return { nom: p?.nom, source: line.source, jours: parseNum(line.jours), pu: getPosteRate(line.posteId, line.source), total: lineTotalPoste(line) };
+}
+function exportParams() {
+  const out = {
+    meta: { type: 'params', version: 2, exported_at: new Date().toISOString() },
+    structure: params.structure,
+    postes: params.postes,
+    materiel: params.materiel,
+    frais: params.frais,
+    templates: params.templates,
+  };
+  download(JSON.stringify(out, null, 2), `parametres-mcp-${ymd()}.json`);
+}
+function download(content, filename) {
+  const blob = new Blob([content], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+function ymd() {
+  const d = new Date();
+  return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+}
+function slug(s) {
+  return String(s).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'devis';
+}
+
+document.getElementById('btn-export').addEventListener('click', exportDevis);
+document.getElementById('export-params').addEventListener('click', exportParams);
+document.getElementById('btn-import').addEventListener('click', () => document.getElementById('file-import').click());
+document.getElementById('import-params').addEventListener('click', () => document.getElementById('file-import').click());
+
+document.getElementById('file-import').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const data = JSON.parse(text);
+    if (data.meta?.type === 'params') {
+      const ok = await confirmModal('Importer paramètres', 'Cela remplacera tes paramètres actuels (postes, matériel, frais, templates, charges). Confirmer ?');
+      if (!ok) return;
+      params = {
+        structure: data.structure || { ...DEFAULT_STRUCTURE },
+        postes: data.postes || [],
+        materiel: data.materiel || [],
+        frais: data.frais || [],
+        templates: data.templates || [],
+      };
+      saveParams();
+      renderParams(); renderDevis();
+      toast('Paramètres importés');
+    } else if (data.meta?.type === 'devis') {
+      toast("Import de devis non implémenté");
+    } else {
+      toast('Fichier non reconnu');
+    }
+  } catch (err) {
+    toast('Erreur de lecture');
+  }
+  e.target.value = '';
+});
+
+document.getElementById('reset-defaults').addEventListener('click', async () => {
+  const ok = await confirmModal('Réinitialiser', 'Remettre postes, matériel, frais, templates et charges aux valeurs par défaut. Les devis sauvegardés seront conservés. Confirmer ?');
+  if (!ok) return;
+  params = {
+    structure: { ...DEFAULT_STRUCTURE },
+    postes: [...DEFAULT_POSTES],
+    materiel: [...DEFAULT_MATERIEL],
+    frais: [...DEFAULT_FRAIS],
+    templates: [],
+  };
+  saveParams();
+  renderParams(); renderDevis();
+  toast('Paramètres réinitialisés');
+});
+
+// ===== THEME TOGGLE =====
+
+function applyTheme(t) {
+  document.documentElement.setAttribute('data-theme', t);
+  const btn = document.getElementById('btn-theme');
+  if (btn) btn.textContent = t === 'dark' ? '☀' : '◐';
+}
+function loadTheme() {
+  try {
+    const t = localStorage.getItem(STORAGE_KEY_THEME);
+    if (t === 'dark' || t === 'light') return t;
+  } catch (e) {}
+  if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) return 'dark';
+  return 'light';
+}
+function saveTheme(t) { try { localStorage.setItem(STORAGE_KEY_THEME, t); } catch (e) {} }
+applyTheme(loadTheme());
+document.getElementById('btn-theme').addEventListener('click', () => {
+  const cur = document.documentElement.getAttribute('data-theme') || 'light';
+  const next = cur === 'dark' ? 'light' : 'dark';
+  applyTheme(next); saveTheme(next);
+});
+
+
+// ============================================================
+//  CONFIGURATION SYNC — à éditer après setup
+// ============================================================
+// Voir guide de setup à la fin de ce fichier.
+//
+// Pour activer la sync Gist :
+//   1. Crée un Gist privé sur https://gist.github.com
+//   2. Mets dedans un fichier "mcp-data.json" contenant : {}
+//   3. Copie l'ID du Gist (la partie après /username/ dans l'URL)
+//   4. Crée un Personal Access Token "Fine-grained" avec Gist:read+write
+//   5. Renseigne ci-dessous :
+
+const SYNC_CONFIG = {
   enabled: true,            // mettre true après avoir rempli les 3 champs ci-dessous
   gistId: 'cfaf96d58812e4f92bce4c1321a0817f',
   filename: 'mcp-data.json',
