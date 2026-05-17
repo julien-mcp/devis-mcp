@@ -340,6 +340,20 @@ label.field span {
 .badge.parc { background: var(--accent-bg); color: var(--accent); }
 .badge.loue { background: var(--warning-bg); color: var(--warning); }
 .badge.libre { background: var(--surface-2); color: var(--text-muted); }
+.badge.mixed { background: var(--accent-bg); color: var(--accent); border: 1px dashed var(--warning); }
+
+.sublou-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 2px 7px;
+  font-size: 10px;
+  font-weight: 600;
+  border-radius: 2px;
+  background: var(--warning-bg);
+  color: var(--warning);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
 select.source-select {
   padding: 4px 6px; font-size: 11px; background: var(--surface);
   text-transform: uppercase; letter-spacing: 0.04em; font-weight: 500;
@@ -1515,6 +1529,8 @@ function migrateDevis(d) {
     d.materiel.forEach(line => {
       if (line.qte == null) line.qte = 1;
       if (line.noDegressivite == null) line.noDegressivite = false;
+      // v8 : on retire le champ source obsolète (devient dérivé)
+      delete line.source;
     });
   }
 }
@@ -1846,6 +1862,25 @@ function renderPosteSection(phase) {
   document.getElementById(idMap[phase]).textContent = fmtEur(totalSection(arr, lineTotalPoste));
 }
 
+// Calcule la répartition parc/loué pour une ligne, selon le stock et la quantité demandée
+function lineRepartition(line) {
+  const mat = params.materiel.find(m => m.id === line.matId);
+  if (!mat) return { qteParc: 0, qteLoue: 0, mat: null };
+  const qte = parseNum(line.qte) || 1;
+  if (!mat.parc) {
+    // 100% loué
+    return { qteParc: 0, qteLoue: qte, mat };
+  }
+  const stock = mat.qteDispo || 0;
+  if (stock <= 0) {
+    // En théorie marqué parc mais sans stock → tout loué
+    return { qteParc: 0, qteLoue: qte, mat };
+  }
+  const qteParc = Math.min(qte, stock);
+  const qteLoue = Math.max(0, qte - stock);
+  return { qteParc, qteLoue, mat };
+}
+
 function renderMaterielSection() {
   const tbody = document.querySelector('#tbl-materiel tbody');
   tbody.innerHTML = '';
@@ -1864,31 +1899,40 @@ function renderMaterielSection() {
       const coef = lineCoefMateriel(line);
       const total = prix * qte * coef;
 
-      // Cellule Source
+      // Répartition parc/loué automatique
+      const { qteParc, qteLoue } = lineRepartition(line);
+      
+      // Cellule Source : libellé dynamique
       let sourceCell;
-      if (mat.parc) {
-        sourceCell = `<select class="source-select" data-action="mat-source" data-idx="${idx}">
-          <option value="parc" ${line.source === 'parc' ? 'selected' : ''}>Parc</option>
-          <option value="loue" ${line.source === 'loue' ? 'selected' : ''}>Loué</option>
-        </select>`;
+      if (qteParc > 0 && qteLoue > 0) {
+        sourceCell = `<span class="badge mixed" title="${qteParc} venant du parc + ${qteLoue} sous-loué(s)">${qteParc} parc + ${qteLoue} loué</span>`;
+      } else if (qteParc > 0) {
+        sourceCell = `<span class="badge parc">parc</span>`;
       } else {
         sourceCell = `<span class="badge loue">loué</span>`;
       }
       
-      // Badge dispo (uniquement si parc=true et qteDispo connu)
-      const qteDispo = mat.qteDispo;
-      const overQte = (mat.parc && line.source === 'parc' && qteDispo > 0 && qte > qteDispo);
+      // Badge dispo (uniquement si stock parc > 0)
+      const stock = mat.qteDispo || 0;
       let qteBadge = '';
-      if (mat.parc && qteDispo > 0 && line.source === 'parc') {
-        const overCls = overQte ? 'over' : '';
-        qteBadge = `<span class="dispo-badge ${overCls}" title="${overQte ? 'Quantité demandée supérieure au stock parc !' : 'Disponible en parc'}">${qte}/${qteDispo}</span>`;
+      if (mat.parc && stock > 0) {
+        const overCls = qteLoue > 0 ? 'over' : '';
+        const title = qteLoue > 0 
+          ? `${qteParc} en parc + ${qteLoue} à sous-louer` 
+          : 'Disponible en parc';
+        qteBadge = `<span class="dispo-badge ${overCls}" title="${title}">${qte}/${stock}</span>`;
+      }
+      
+      // Badge "X sous-louées" si dépassement
+      let sublouBadge = '';
+      if (qteLoue > 0 && mat.parc && stock > 0) {
+        sublouBadge = `<span class="sublou-badge" title="${qteLoue} sous-loué(s) chez un loueur">+${qteLoue} sous-loué${qteLoue > 1 ? 's' : ''}</span>`;
       }
       
       // Badge coefficient (cliquable pour toggle plein tarif)
       const baseCoefForCat = getCoefficient(mat.cat, jours);
       let coefBadge;
       if (line.noDegressivite) {
-        // Mode plein tarif : on multiplie par "jours" direct
         coefBadge = `<span class="coef-badge full" data-action="mat-toggle-degress" data-idx="${idx}" title="Plein tarif (cliquer pour réactiver la dégressivité)">×${jours.toFixed(jours % 1 ? 1 : 0)} <small>plein</small></span>`;
       } else if (jours > 0) {
         coefBadge = `<span class="coef-badge" data-action="mat-toggle-degress" data-idx="${idx}" title="Coefficient dégressif (cliquer pour mettre en plein tarif)">×${baseCoefForCat.toFixed(2).replace(/\.?0+$/, '')}</span>`;
@@ -1900,10 +1944,11 @@ function renderMaterielSection() {
         <td>
           ${escapeHtml(mat.nom)}
           ${qteBadge}
+          ${sublouBadge}
         </td>
         <td class="ctr">${sourceCell}</td>
         <td class="num">${fmtEur(prix)}</td>
-        <td class="num"><input type="text" class="num qty ${overQte ? 'over' : ''}" value="${qte}" data-action="mat-qte" data-idx="${idx}"></td>
+        <td class="num"><input type="text" class="num qty ${qteLoue > 0 && mat.parc ? 'over' : ''}" value="${qte}" data-action="mat-qte" data-idx="${idx}"></td>
         <td class="num"><input type="text" class="num qty" value="${line.jours}" data-action="mat-jours" data-idx="${idx}"></td>
         <td class="ctr">${coefBadge}</td>
         <td class="num total">${fmtEur(total)}</td>
@@ -2016,10 +2061,10 @@ function addPosteLine(phase, posteId) {
 function addMaterielLine(matId, opts) {
   const mat = params.materiel.find(m => m.id === matId);
   if (!mat) return;
-  const defaultSource = mat.parc ? 'parc' : 'loue';
   const jours = opts && opts.jours ? opts.jours : 1;
   const qte = opts && opts.qte ? opts.qte : 1;
-  devis.materiel.push({ id: uid(), matId, source: defaultSource, qte, jours, noDegressivite: false, _flash: true });
+  // Plus de champ source : c'est calculé automatiquement à l'affichage
+  devis.materiel.push({ id: uid(), matId, qte, jours, noDegressivite: false, _flash: true });
   saveDevis(); renderDevis();
 }
 function addFraisLine(fraisId) {
@@ -2088,7 +2133,6 @@ document.addEventListener('change', (e) => {
     const idx = parseInt(t.dataset.idx, 10);
     const phase = t.dataset.phase;
     if (action === 'source') { devis[phase][idx].source = t.value; saveDevis(); renderDevis(); }
-    else if (action === 'mat-source') { devis.materiel[idx].source = t.value; saveDevis(); renderDevis(); }
     return;
   }
   const a = t.dataset.catAction;
@@ -2697,7 +2741,22 @@ function exportDevis() {
       postprod: devis.postprod.map(buildPosteDetail),
       materiel: devis.materiel.map(l => {
         const m = params.materiel.find(x => x.id === l.matId);
-        return { nom: m?.nom, source: l.source, jours: parseNum(l.jours), pu: m?.prix, total: lineTotalMateriel(l) };
+        const rep = lineRepartition(l);
+        let sourceLabel;
+        if (rep.qteParc > 0 && rep.qteLoue > 0) sourceLabel = rep.qteParc + ' parc + ' + rep.qteLoue + ' loué';
+        else if (rep.qteParc > 0) sourceLabel = 'parc';
+        else sourceLabel = 'loué';
+        return { 
+          nom: m?.nom, 
+          source: sourceLabel,
+          qteParc: rep.qteParc,
+          qteLoue: rep.qteLoue,
+          qte: parseNum(l.qte) || 1,
+          jours: parseNum(l.jours), 
+          pu: m?.prix, 
+          coef: lineCoefMateriel(l),
+          total: lineTotalMateriel(l) 
+        };
       }),
       frais: devis.frais.map(l => ({ nom: l.nom, cat: l.cat, pu: parseNum(l.pu), qte: parseNum(l.qte), total: lineTotalFrais(l) })),
     },
