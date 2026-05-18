@@ -826,6 +826,10 @@ dialog.modal::backdrop { background: rgba(0,0,0,0.6); backdrop-filter: blur(2px)
   animation: pulse 1s ease-in-out infinite;
 }
 .sync-indicator.error .sync-dot { background: var(--danger); }
+.sync-indicator.conflict .sync-dot {
+  background: var(--danger);
+  animation: pulse 1.5s ease-in-out infinite;
+}
 .sync-indicator.local .sync-dot { background: var(--text-dim); }
 
 @keyframes pulse {
@@ -1480,10 +1484,15 @@ function loadParams() {
     if (raw) {
       const p = JSON.parse(raw);
       if (!p.templates) p.templates = [];
+      // v10 : versioning
+      if (p.version == null) p.version = 1;
+      if (p.lastModifiedBy == null) p.lastModifiedBy = getDeviceId();
       return p;
     }
   } catch (e) {}
   return {
+    version: 1,
+    lastModifiedBy: 'init',
     structure: { ...DEFAULT_STRUCTURE },
     postes: [...DEFAULT_POSTES],
     materiel: [...DEFAULT_MATERIEL],
@@ -1492,6 +1501,10 @@ function loadParams() {
   };
 }
 function saveParams() {
+  // v10 : incrémenter la version
+  params.version = (params.version || 0) + 1;
+  params.lastModifiedBy = getDeviceId();
+  params.updatedAt = Date.now();
   try { localStorage.setItem(STORAGE_KEY_PARAMS, JSON.stringify(params)); } catch (e) {}
 }
 
@@ -1520,6 +1533,8 @@ function emptyDevis() {
     id: uid('d'),
     createdAt: Date.now(),
     updatedAt: Date.now(),
+    version: 1,            // incrémenté à chaque modif locale
+    lastModifiedBy: getDeviceId(),
     projet: { nom: '', client: '', date: '', ref: '' },
     preprod: [],
     prod: [],
@@ -1530,6 +1545,18 @@ function emptyDevis() {
     remiseMatPct: 0,      // remise sur sous-total matériel en %
     prixFinal: null,
   };
+}
+
+// Device ID stable par navigateur (pour traçabilité des modifs)
+function getDeviceId() {
+  try {
+    let id = localStorage.getItem('calc-mcp-device-id');
+    if (!id) {
+      id = 'dev-' + Math.random().toString(36).slice(2, 10);
+      localStorage.setItem('calc-mcp-device-id', id);
+    }
+    return id;
+  } catch (e) { return 'dev-unknown'; }
 }
 
 function uid(prefix = 'l') {
@@ -1553,20 +1580,32 @@ function migrateDevis(d) {
   }
   // v9 : initialiser la remise matériel si absente
   if (d && d.remiseMatPct == null) d.remiseMatPct = 0;
+  // v10 : versioning
+  if (d && d.version == null) d.version = 1;
+  if (d && d.lastModifiedBy == null) d.lastModifiedBy = getDeviceId();
 }
 
 function initCurrentDevis() {
-  // Migrer tous les devis de la liste
-  devisList.forEach(migrateDevis);
+  // Migrer tous les devis de la liste (mais ignorer les tombstones)
+  devisList.forEach(d => { if (!d.deleted) migrateDevis(d); });
+  // Purger les vieux tombstones
+  purgeOldTombstones();
   saveDevisList();
   
   const currentId = loadCurrentId();
   if (currentId) {
-    const found = devisList.find(d => d.id === currentId);
+    const found = devisList.find(d => d.id === currentId && !d.deleted);
     if (found) {
       devis = found;
       return;
     }
+  }
+  // Pas de devis courant valide → prendre le premier non-supprimé
+  const alive = devisList.find(d => !d.deleted);
+  if (alive) {
+    devis = alive;
+    saveCurrentId(devis.id);
+    return;
   }
   // Sinon créer un nouveau devis vide
   devis = emptyDevis();
@@ -1578,18 +1617,20 @@ function initCurrentDevis() {
 function saveDevis() {
   if (!devis) return;
   devis.updatedAt = Date.now();
+  devis.version = (devis.version || 0) + 1;
+  devis.lastModifiedBy = getDeviceId();
   // Mettre à jour la liste : remplacer ou ajouter
   const idx = devisList.findIndex(d => d.id === devis.id);
   if (idx >= 0) devisList[idx] = devis;
   else devisList.unshift(devis);
-  // Limiter la taille
+  // Limiter la taille (mais préserver les tombstones)
   if (devisList.length > MAX_DEVIS) devisList.length = MAX_DEVIS;
   saveDevisList();
   saveCurrentId(devis.id);
 }
 
 function switchToDevis(id) {
-  const found = devisList.find(d => d.id === id);
+  const found = devisList.find(d => d.id === id && !d.deleted);
   if (!found) return false;
   devis = found;
   saveCurrentId(devis.id);
@@ -1629,18 +1670,35 @@ function duplicateDevis(sourceId) {
 function deleteDevis(id) {
   const idx = devisList.findIndex(d => d.id === id);
   if (idx < 0) return;
-  devisList.splice(idx, 1);
+  // v10 : on remplace par un tombstone au lieu de supprimer
+  const existing = devisList[idx];
+  devisList[idx] = {
+    id: existing.id,
+    deleted: true,
+    deletedAt: Date.now(),
+    version: (existing.version || 0) + 1,
+    lastModifiedBy: getDeviceId(),
+  };
   saveDevisList();
   if (devis && devis.id === id) {
     // Le devis supprimé est le courant → on bascule
-    if (devisList.length > 0) {
-      devis = devisList[0];
+    const alive = devisList.filter(d => !d.deleted);
+    if (alive.length > 0) {
+      devis = alive[0];
       saveCurrentId(devis.id);
     } else {
       createNewDevis();
     }
     renderDevis();
   }
+}
+
+// Purge des tombstones > 30 jours
+function purgeOldTombstones() {
+  const cutoff = Date.now() - 30 * 24 * 3600 * 1000;
+  const before = devisList.length;
+  devisList = devisList.filter(d => !(d.deleted && d.deletedAt < cutoff));
+  if (devisList.length < before) saveDevisList();
 }
 
 // ===== UTILITAIRES =====
@@ -2700,7 +2758,8 @@ document.getElementById('devis-list-search').addEventListener('input', () => ren
 function renderDevisListModal() {
   const q = (document.getElementById('devis-list-search').value || '').trim().toLowerCase();
   const ul = document.getElementById('devis-list-ul');
-  let list = [...devisList].sort((a, b) => b.updatedAt - a.updatedAt);
+  // v10 : exclure les tombstones de l'affichage
+  let list = devisList.filter(d => !d.deleted).sort((a, b) => b.updatedAt - a.updatedAt);
   if (q) {
     list = list.filter(d =>
       (d.projet.nom || '').toLowerCase().includes(q) ||
@@ -2735,7 +2794,8 @@ function renderDevisListModal() {
       </li>`;
     }).join('');
   }
-  document.getElementById('devis-list-info').textContent = `${devisList.length} devis sauvegardés (max ${MAX_DEVIS}).`;
+  const aliveCount = devisList.filter(d => !d.deleted).length;
+  document.getElementById('devis-list-info').textContent = `${aliveCount} devis sauvegardés (max ${MAX_DEVIS}).`;
 }
 
 document.getElementById('devis-list-ul').addEventListener('click', async (e) => {
@@ -3227,11 +3287,14 @@ function updateSyncUI() {
     local: RUNTIME_TOKEN ? 'local' : 'attente token',
     syncing: 'sync…',
     synced: 'synchro OK',
-    error: 'erreur sync'
+    error: 'erreur sync',
+    conflict: '⚠ conflit',
   };
   document.getElementById('sync-label').textContent = labels[sync.state] || sync.state;
   el.title = sync.state === 'error' && sync.lastError
     ? 'Erreur : ' + sync.lastError + ' (les modifs restent en local)'
+    : sync.state === 'conflict'
+    ? 'Conflit détecté : ' + (sync.lastError || 'modifications distantes plus récentes') + ' — cliquer pour résoudre'
     : sync.state === 'synced' ? 'Données synchronisées avec le Gist'
     : sync.state === 'syncing' ? 'Synchronisation en cours…'
     : SYNC_CONFIG.enabled ? 'En attente…' : 'Sync Gist désactivée (mode local uniquement)';
@@ -3293,21 +3356,143 @@ async function gistPush(payload) {
   }
 }
 
-// Debounced push : on attend 1.5 s sans modification avant d'envoyer
+// Debounced push : on attend 1.5 s sans modification avant d'envoyer.
+// v10 : MERGE par version pour éviter les écrasements.
 function scheduleSync() {
   if (!SYNC_CONFIG.enabled) return;
   if (sync.pendingTimeout) clearTimeout(sync.pendingTimeout);
-  sync.pendingTimeout = setTimeout(() => {
+  sync.pendingTimeout = setTimeout(async () => {
     sync.pendingTimeout = null;
-    const payload = {
-      version: 3,
-      updatedAt: Date.now(),
-      params,
-      devisList,
-      currentDevisId: devis ? devis.id : null,
-    };
-    gistPush(payload);
+    await mergeAndPush();
   }, sync.saveDebounceMs);
+}
+
+// Merge la version locale avec le distant et push si OK
+async function mergeAndPush() {
+  if (!SYNC_CONFIG.enabled || !RUNTIME_TOKEN) return;
+  
+  // 1. Tirer le distant pour comparer les versions
+  const remote = await gistFetch();
+  if (remote === null) {
+    // Erreur fetch — on ne push pas pour éviter d'écraser. Mais on garde local.
+    return;
+  }
+  
+  // 2. Merger params (versioning au niveau racine)
+  const localParamsVersion = params.version || 0;
+  const remoteParamsVersion = (remote.params && remote.params.version) || 0;
+  if (remoteParamsVersion > localParamsVersion) {
+    // Le distant a évolué : on prend le distant
+    params = remote.params;
+    _origSaveParams();
+    toast('Paramètres mis à jour depuis le serveur');
+  }
+  // Si local > remote, on garde local (on poussera après)
+  
+  // 3. Merger devisList (versioning par devis, avec gestion tombstones)
+  const merged = mergeDevisLists(devisList, remote.devisList || []);
+  let conflictsCount = 0;
+  let pullsCount = 0;
+  for (const m of merged) {
+    if (m.action === 'remote-wins') pullsCount++;
+    if (m.action === 'conflict') conflictsCount++;
+  }
+  devisList = merged.map(m => m.devis);
+  _origSaveDevisList();
+  
+  // 4. Si conflits, prévenir et NE PAS PUSH
+  if (conflictsCount > 0) {
+    sync.state = 'conflict';
+    sync.lastError = `${conflictsCount} conflit(s) — voir la console`;
+    updateSyncUI();
+    toast(`⚠️ ${conflictsCount} devis en conflit — données distantes plus récentes`, 'error');
+    // On force un re-rendu pour afficher les éventuels devis tirés
+    if (pullsCount > 0) renderDevis();
+    // On retentera plus tard
+    setTimeout(() => scheduleSync(), 5000);
+    return;
+  }
+  
+  // 5. Si pull seulement, re-render et stop
+  if (pullsCount > 0 && !hasLocalChanges(merged)) {
+    renderDevis();
+    toast(`${pullsCount} devis mis à jour depuis le serveur`);
+    return;
+  }
+  
+  // 6. Push final (notre version + les remotes acceptés)
+  const payload = {
+    version: 10,
+    updatedAt: Date.now(),
+    params,
+    devisList,
+    currentDevisId: devis ? devis.id : null,
+  };
+  await gistPush(payload);
+  if (pullsCount > 0) {
+    renderDevis();
+    toast(`Synchronisé (${pullsCount} mises à jour reçues)`);
+  }
+}
+
+// Vrai si l'un des éléments a action 'local-wins' ou 'local-new'
+function hasLocalChanges(merged) {
+  return merged.some(m => m.action === 'local-wins' || m.action === 'local-new');
+}
+
+// Fusion intelligente de 2 listes de devis (avec tombstones).
+// Retourne [{ devis, action }] où action ∈ 'local-wins', 'remote-wins', 'conflict', 'local-new', 'remote-new', 'same'
+function mergeDevisLists(local, remote) {
+  const byId = new Map();
+  const myDeviceId = getDeviceId();
+  
+  // Indexer local
+  for (const d of local) {
+    byId.set(d.id, { local: d, remote: null });
+  }
+  // Indexer remote
+  for (const d of remote) {
+    if (byId.has(d.id)) byId.get(d.id).remote = d;
+    else byId.set(d.id, { local: null, remote: d });
+  }
+  
+  const result = [];
+  for (const [id, pair] of byId.entries()) {
+    const L = pair.local, R = pair.remote;
+    
+    if (L && !R) {
+      // Local uniquement → on garde, on poussera
+      result.push({ devis: L, action: 'local-new' });
+    } else if (!L && R) {
+      // Remote uniquement → on prend
+      result.push({ devis: R, action: 'remote-new' });
+    } else {
+      // Les deux existent : comparer versions
+      const vL = L.version || 0, vR = R.version || 0;
+      if (vL === vR) {
+        // Même version → on garde le local (identiques en théorie)
+        result.push({ devis: L, action: 'same' });
+      } else if (vL > vR) {
+        // Local plus récent → on garde local
+        result.push({ devis: L, action: 'local-wins' });
+      } else {
+        // Remote plus récent : potentiel conflit !
+        // Cas 1 : local n'a pas été modifié récemment (lastModifiedBy autre device) → pas de conflit, on prend remote
+        // Cas 2 : local a été modifié ici récemment → CONFLIT
+        const localModifiedHere = L.lastModifiedBy === myDeviceId;
+        const localIsRecent = (Date.now() - (L.updatedAt || 0)) < 5 * 60 * 1000; // 5 min
+        if (localModifiedHere && localIsRecent && vL > 1) {
+          // Conflit avéré
+          result.push({ devis: R, action: 'conflict' });
+          console.warn('[Sync] CONFLIT sur devis', id, 'local v' + vL, 'vs remote v' + vR);
+        } else {
+          // Pas de conflit, on prend remote
+          result.push({ devis: R, action: 'remote-wins' });
+        }
+      }
+    }
+  }
+  return result;
 }
 
 // On wrappe les fonctions de sauvegarde existantes pour déclencher la sync
@@ -3450,64 +3635,23 @@ function updateSheetsSyncUI() {
 }
 
 
-// Au chargement : si Gist activé, on récupère le state distant et on l'applique si plus récent
+// Au chargement : on tire le distant et on merge proprement
 async function syncOnStart() {
   if (!SYNC_CONFIG.enabled) {
     updateSyncUI();
     return;
   }
-  const remote = await gistFetch();
-  if (!remote || !remote.updatedAt) return;
-  const localUpdatedAt = Math.max(
-    ...devisList.map(d => d.updatedAt || 0),
-    0
-  );
-  // Si le remote est plus récent que tout ce qu'on a localement, on le prend
-  if (remote.updatedAt > localUpdatedAt) {
-    if (remote.params) params = remote.params;
-    if (remote.devisList) devisList = remote.devisList;
-    if (!params.templates) params.templates = [];
-    // Sauvegarder en local (sans déclencher de sync)
-    _origSaveParams();
-    _origSaveDevisList();
-    if (remote.currentDevisId) {
-      const found = devisList.find(d => d.id === remote.currentDevisId);
-      if (found) { devis = found; saveCurrentId(devis.id); }
-    }
-    renderDevis();
-    toast('Devis mis à jour depuis le serveur');
-  } else if (localUpdatedAt > (remote.updatedAt || 0)) {
-    // Local plus récent : on pousse
-    scheduleSync();
-  }
+  await mergeAndPush();
 }
 
-// Force sync : bouton manuel pour récupérer le distant ou pousser
+// Force sync : bouton manuel pour récupérer le distant
 async function forceSyncPull() {
   if (!SYNC_CONFIG.enabled) {
     toast('Sync désactivée — voir config dans le code');
     return;
   }
-  const remote = await gistFetch();
-  if (!remote) {
-    toast('Impossible de récupérer le distant');
-    return;
-  }
-  if (!remote.updatedAt) {
-    toast('Le Gist est vide, rien à récupérer');
-    return;
-  }
-  if (remote.params) params = remote.params;
-  if (remote.devisList) devisList = remote.devisList;
-  if (!params.templates) params.templates = [];
-  _origSaveParams();
-  _origSaveDevisList();
-  if (remote.currentDevisId) {
-    const found = devisList.find(d => d.id === remote.currentDevisId);
-    if (found) { devis = found; saveCurrentId(devis.id); }
-  }
-  renderDevis();
-  toast('Devis rechargés depuis le serveur');
+  await mergeAndPush();
+  toast('Synchronisation forcée terminée');
 }
 
 // Cliquer sur l'indicateur force un pull
